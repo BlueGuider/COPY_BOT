@@ -3,7 +3,7 @@ import { WalletService } from './wallet';
 import { ContractService } from './contracts';
 import { PancakeSwapService } from './pancakeSwap';
 import { ValidationUtils } from '../utils/validation';
-import { getCurrentGasPrice, sendRawTransaction, getBalance } from '../utils/web3';
+import { getCurrentGasPrice, sendRawTransaction, getBalance, publicClient } from '../utils/web3';
 import { NonceManager } from './nonceManager';
 import { 
   TOKEN_MANAGER_V1_ABI, 
@@ -573,7 +573,8 @@ export class TradingService {
       
       const results = [];
       let successCount = 0;
-      
+      const TIMING_ENABLED = process.env.TIMING_ENABLED === 'true';
+
       for (let i = 0; i < transactions.length; i++) {
         try {
           // Convert the signed transaction back to hex format
@@ -582,7 +583,46 @@ export class TradingService {
           console.log(`📤 Submitting transaction ${i + 1}: ${signedTx.slice(0, 20)}...`);
           
           // Submit transaction to the network
+          let headAtSubmit: bigint | undefined;
+          const tSendStart = Date.now();
+          if (TIMING_ENABLED) {
+            try { headAtSubmit = await publicClient.getBlockNumber(); } catch {}
+          }
           const txHash = await sendRawTransaction(signedTx as `0x${string}`);
+          const sendMs = Date.now() - tSendStart;
+          if (TIMING_ENABLED) {
+            console.log(`   ⏱ [block] send: ${sendMs}ms`);
+            // Best-effort propagation timing (non-blocking)
+            (async () => {
+              try {
+                const start = Date.now();
+                const deadline = start + 2000;
+                while (Date.now() < deadline) {
+                  try {
+                    const tx = await publicClient.getTransaction({ hash: txHash });
+                    if (tx) {
+                      console.log(`   ⏱ [block] propagation: ${Date.now() - start}ms`);
+                      break;
+                    }
+                  } catch {}
+                  await new Promise(r => setTimeout(r, 100));
+                }
+              } catch {}
+            })();
+            // Inclusion timing and block delta (non-blocking)
+            (async () => {
+              try {
+                const tWaitStart = Date.now();
+                const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
+                const includeMs = Date.now() - tWaitStart;
+                let blockDelta: number | undefined;
+                if (typeof headAtSubmit !== 'undefined') {
+                  try { blockDelta = Number(receipt.blockNumber - headAtSubmit); } catch {}
+                }
+                console.log(`   ⏱ [block] inclusion: ${includeMs}ms${blockDelta !== undefined ? `, blockΔ=${blockDelta}` : ''}`);
+              } catch {}
+            })();
+          }
           
           console.log(`✅ Transaction ${i + 1} submitted successfully: ${txHash}`);
           results.push({ success: true, txHash });
