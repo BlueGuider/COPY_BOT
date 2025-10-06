@@ -63,6 +63,7 @@ export class CopyTradingService {
   private static readonly DEDUPE_TTL_MS = parseInt(process.env.COPY_DEDUPE_TTL_MS || '60000');
   private static readonly TOKEN_DEBOUNCE_MS = parseInt(process.env.COPY_TOKEN_DEBOUNCE_MS || '3000');
   private static readonly MEMPOOL_GETTX_PER_SEC = parseInt(process.env.MEMPOOL_GETTX_PER_SEC || '50');
+  private static readonly MEMPOOL_ALLOW_TOKEN_CONTRACT_CHECK = process.env.MEMPOOL_ALLOW_TOKEN_CONTRACT_CHECK === 'true';
 
   // Simple token-bucket limiter for getTransaction calls
   private static rlTokens = CopyTradingService.MEMPOOL_GETTX_PER_SEC;
@@ -159,10 +160,12 @@ export class CopyTradingService {
             const toAddress = tx.to?.toLowerCase();
             if (!toAddress) return;
 
-            // Quick pre-filter: only proceed if to is known trading contract or token contract
+            // Quick pre-filter
+            // In mempool mode, avoid expensive token checks unless explicitly enabled.
+            // Only pass through known trading contracts by default.
             const isKnown = await this.isKnownTradingContract(toAddress);
             let proceed = isKnown;
-            if (!proceed) {
+            if (!proceed && this.MEMPOOL_ALLOW_TOKEN_CONTRACT_CHECK) {
               try {
                 proceed = await this.isTokenContract(toAddress);
               } catch (_) {
