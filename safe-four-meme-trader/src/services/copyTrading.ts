@@ -396,12 +396,12 @@ export class CopyTradingService {
    */
   private static async analyzeAndCopyTransaction(
     userId: string,
-    config: CopyTradingConfig,
+    copyCfg: CopyTradingConfig,
     tx: any,
     opts?: { allowReceiptLookup?: boolean }
   ): Promise<void> {
     try {
-      const modeLabel = (config_1.config?.monitoring?.mode === 'mempool') ? '[mempool]' : '[block]';
+      const modeLabel = (config.monitoring?.mode === 'mempool') ? '[mempool]' : '[block]';
       const allowReceiptLookup = opts?.allowReceiptLookup ?? true;
       const toAddress = tx.to?.toLowerCase();
       if (!toAddress) {
@@ -448,7 +448,7 @@ export class CopyTradingService {
 
       // Check if token is allowed/blocked
       console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Checking if token is allowed...`);
-      if (!this.isTokenAllowed(config, tradeInfo.tokenAddress)) {
+      if (!this.isTokenAllowed(copyCfg, tradeInfo.tokenAddress)) {
         console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Token not allowed`);
         return;
       }
@@ -494,29 +494,29 @@ export class CopyTradingService {
         if (profitInfo.profitPercent >= 5) {
           // Good profit (5%+), sell immediately
           console.log(`   ✅ Good profit (${profitInfo.profitPercent.toFixed(2)}%), selling immediately`);
-          copyAmount = Math.min(config.maxPositionSize, 0.001);
+          copyAmount = Math.min(copyCfg.maxPositionSize, 0.001);
         } else {
           // Low profit (<5%), hold for 2 minutes and monitor
           console.log(`   ⏳ Low profit (${profitInfo.profitPercent.toFixed(2)}%), holding for 2 minutes...`);
-          await this.scheduleSmartSell(tradeInfo.tokenAddress, userId, config, profitInfo);
+          await this.scheduleSmartSell(tradeInfo.tokenAddress, userId, copyCfg, profitInfo);
           return; // Don't execute immediate sell
         }
         
-        if (copyAmount < config.minPositionSize) {
-          console.log(`   ❌ SELL copy amount too small (${copyAmount.toFixed(6)} < ${config.minPositionSize}), skipping trade`);
+        if (copyAmount < copyCfg.minPositionSize) {
+          console.log(`   ❌ SELL copy amount too small (${copyAmount.toFixed(6)} < ${copyCfg.minPositionSize}), skipping trade`);
           return;
         }
       } else {
         // For BUY transactions, use the original BNB amount
-        console.log(`   📊 Original BUY amount: ${tradeInfo.bnbAmount.toFixed(6)} BNB, Copy ratio: ${(config.copyRatio * 100).toFixed(1)}%`);
+        console.log(`   📊 Original BUY amount: ${tradeInfo.bnbAmount.toFixed(6)} BNB, Copy ratio: ${(copyCfg.copyRatio * 100).toFixed(1)}%`);
         copyAmount = Math.min(
-          tradeInfo.bnbAmount * config.copyRatio,
-          config.maxPositionSize
+          tradeInfo.bnbAmount * copyCfg.copyRatio,
+          copyCfg.maxPositionSize
         );
 
-        console.log(`   💰 BUY copy amount: ${copyAmount.toFixed(6)} BNB, Min position size: ${config.minPositionSize} BNB`);
-        if (copyAmount < config.minPositionSize) {
-          console.log(`   ❌ BUY copy amount too small (${copyAmount.toFixed(6)} < ${config.minPositionSize}), skipping trade`);
+        console.log(`   💰 BUY copy amount: ${copyAmount.toFixed(6)} BNB, Min position size: ${copyCfg.minPositionSize} BNB`);
+        if (copyAmount < copyCfg.minPositionSize) {
+          console.log(`   ❌ BUY copy amount too small (${copyAmount.toFixed(6)} < ${copyCfg.minPositionSize}), skipping trade`);
           return;
         }
       }
@@ -539,7 +539,7 @@ export class CopyTradingService {
       console.log(`   🪙 Token: ${tradeInfo.tokenAddress.slice(0, 10)}...${tradeInfo.tokenAddress.slice(-6)}`);
       console.log(`   💰 Amount: ${tradeInfo.bnbAmount.toFixed(6)} BNB`);
       console.log(`   🏢 Platform: ${platformInfo.platform}`);
-      console.log(`   📊 Copy: ${copyAmount.toFixed(6)} BNB (${(config.copyRatio * 100).toFixed(1)}%)`);
+      console.log(`   📊 Copy: ${copyAmount.toFixed(6)} BNB (${(copyCfg.copyRatio * 100).toFixed(1)}%)`);
       if (tradeInfo.tokenAmount) {
         console.log(`   🪙 Tokens: ${tradeInfo.tokenAmount.toFixed(2)}`);
       }
@@ -552,7 +552,7 @@ export class CopyTradingService {
         tradeType: tradeInfo.type,
         targetAmount: tradeInfo.bnbAmount,
         copiedAmount: copyAmount,
-        copyRatio: config.copyRatio,
+        copyRatio: copyCfg.copyRatio,
         executedAt: new Date(),
         status: 'PENDING',
         userId: userId,
@@ -562,9 +562,9 @@ export class CopyTradingService {
       this.activeTrades.set(copyTrade.id, copyTrade);
 
       // Execute copy trade with delay
-      console.log(`⏰ Scheduling copy trade execution in ${config.delayMs}ms...`);
-      if (config.delayMs && config.delayMs > 0) {
-        console.log(`   ⏱ ${modeLabel} delay: ${config.delayMs}ms`);
+      console.log(`⏰ Scheduling copy trade execution in ${copyCfg.delayMs}ms...`);
+      if (copyCfg.delayMs && copyCfg.delayMs > 0) {
+        console.log(`   ⏱ ${modeLabel} delay: ${copyCfg.delayMs}ms`);
       }
       // Guard against scheduling multiple executions for the same target tx per user
       const scheduleKey = `${userId}:${copyTrade.targetTxHash}`;
@@ -581,7 +581,7 @@ export class CopyTradingService {
         } catch (error) {
           console.error(`❌ Error executing copy trade:`, error);
         }
-      }, config.delayMs);
+      }, copyCfg.delayMs);
 
     } catch (error) {
       console.error('Error analyzing transaction:', error);
