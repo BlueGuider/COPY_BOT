@@ -8,6 +8,7 @@ import {
   PANCAKESWAP_V2_FACTORY_ABI,
   ERC20_ABI 
 } from '../contracts/abis';
+import { NonceManager } from './nonceManager';
 import { CONTRACT_ADDRESSES, GAS_LIMITS } from '../config';
 import { 
   ApiResponse
@@ -111,13 +112,16 @@ export class PancakeSwapService {
 
       // Prepare transactions
       const transactions: string[] = [];
+      const fromAddresses: string[] = [];
       let successCount = 0;
 
       for (const walletAddress of fundedWallets) {
         try {
           const walletClient = WalletService.createWalletClient(userId, walletAddress);
-          let nonce = await publicClient.getTransactionCount({ address: walletAddress as `0x${string}` });
-          const gasPrice = await getCurrentGasPrice();
+          const [nonce, gasPrice] = await Promise.all([
+            NonceManager.getNextNonce(walletAddress as `0x${string}`),
+            getCurrentGasPrice()
+          ]);
 
           // Calculate minimum amount out with slippage
           const amountOutMin = BigInt(Math.floor(bestRoute.estimatedOutput * (100 - slippagePercent) / 100));
@@ -150,6 +154,7 @@ export class PancakeSwapService {
             });
 
             transactions.push(signature.slice(2)); // Remove 0x prefix
+            fromAddresses.push(walletAddress);
             successCount++;
 
           } else if (bestRoute.version === 'V3') {
@@ -183,6 +188,7 @@ export class PancakeSwapService {
             });
 
             transactions.push(signature.slice(2)); // Remove 0x prefix
+            fromAddresses.push(walletAddress);
             successCount++;
           }
 
@@ -204,7 +210,7 @@ export class PancakeSwapService {
       }
 
       // Submit bundle
-      const bundleResult = await this.submitBundle(transactions);
+      const bundleResult = await this.submitBundle(transactions, fromAddresses);
 
       return {
         success: bundleResult.success,
@@ -274,13 +280,17 @@ export class PancakeSwapService {
 
       // Prepare transactions
       const transactions: string[] = [];
+      const fromAddresses: string[] = [];
       let successCount = 0;
 
       for (const walletAddress of walletAddresses) {
         try {
           const walletClient = WalletService.createWalletClient(userId, walletAddress);
-          let nonce = await publicClient.getTransactionCount({ address: walletAddress as `0x${string}` });
-          const gasPrice = await getCurrentGasPrice();
+          const [nonceInitial, gasPrice] = await Promise.all([
+            NonceManager.getNextNonce(walletAddress as `0x${string}`),
+            getCurrentGasPrice()
+          ]);
+          let nonce = nonceInitial;
 
           // Get token balance
           const balance = await publicClient.readContract({
@@ -335,7 +345,9 @@ export class PancakeSwapService {
             });
 
             transactions.push(approveSignature.slice(2));
-            nonce++;
+            fromAddresses.push(walletAddress);
+            // Reserve the next nonce for the subsequent sell transaction
+            nonce = await NonceManager.getNextNonce(walletAddress as `0x${string}`);
           }
 
           // Calculate minimum amount out with slippage
@@ -408,6 +420,7 @@ export class PancakeSwapService {
           console.log(`✅ PancakeSwap sell transaction signed for wallet ${walletAddress.slice(0, 8)}...`);
 
           transactions.push(sellSignature.slice(2));
+          fromAddresses.push(walletAddress);
           successCount++;
 
           // Update wallet last used
@@ -430,7 +443,7 @@ export class PancakeSwapService {
       console.log(`📦 Submitting ${transactions.length} PancakeSwap sell transaction(s)`);
 
       // Submit bundle
-      const bundleResult = await this.submitBundle(transactions);
+      const bundleResult = await this.submitBundle(transactions, fromAddresses);
 
       return {
         success: bundleResult.success,
@@ -645,7 +658,7 @@ export class PancakeSwapService {
   /**
    * Submit transaction bundle for MEV protection
    */
-  private static async submitBundle(transactions: string[]): Promise<{
+  private static async submitBundle(transactions: string[], fromAddresses?: string[]): Promise<{
     success: boolean;
     bundleHash?: string;
     error?: string;
@@ -671,13 +684,21 @@ export class PancakeSwapService {
           results.push({ success: true, txHash });
           successCount++;
           
-          // Wait a bit between transactions to avoid nonce issues
-          await new Promise(resolve => setTimeout(resolve, 200)); // Reduced from 1000ms to 200ms
+          // Short spacing between tx submissions
+          await new Promise(resolve => setTimeout(resolve, 50));
           
         } catch (error) {
-          console.error(`❌ Error submitting PancakeSwap transaction ${i + 1}:`, error);
+          const errMsg = (error as Error).message || String(error);
+          console.error(`❌ Error submitting PancakeSwap transaction ${i + 1}:`, errMsg);
           console.error(`   Transaction data: ${transactions[i].slice(0, 50)}...`);
-          results.push({ success: false, error: (error as Error).message });
+          // If nonce error patterns, resync nonces for this wallet to catch up
+          if (fromAddresses && /nonce too low|invalid nonce|already known/i.test(errMsg)) {
+            const addr = fromAddresses[i];
+            if (addr) {
+              try { await NonceManager.resync(addr as `0x${string}`); } catch {}
+            }
+          }
+          results.push({ success: false, error: errMsg });
         }
       }
       
