@@ -29,7 +29,7 @@ async function main() {
       const messageStr = String(error?.error?.message || error?.message || error?.shortMessage || '');
       if ((innerCode === 26 || topCode === 26 || messageStr.includes('Unknown block'))) {
         // Expected transient error for mempool tx, ignore or log at debug level
-        console.debug('Transient Unknown block error for tx:', txHash);
+
         return;
       }
       // Unexpected error, log or raise alert
