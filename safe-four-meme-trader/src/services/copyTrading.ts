@@ -54,6 +54,8 @@ export class CopyTradingService {
   private static priceTrackingService: PriceTrackingService = PriceTrackingService.getInstance();
   private static csvLogger: CSVLogger = CSVLogger.getInstance();
   private static mempoolProvider: any | null = null;
+  private static mempoolInFlight = 0;
+  private static readonly MEMPOOL_MAX_INFLIGHT = 5;
 
   /**
    * Setup copy trading for a user
@@ -130,6 +132,11 @@ export class CopyTradingService {
 
         this.mempoolProvider.on('pending', async (txHash: string) => {
           try {
+            if (this.mempoolInFlight >= this.MEMPOOL_MAX_INFLIGHT) {
+              // Too many concurrent lookups; drop this hash to avoid rate limits
+              return;
+            }
+            this.mempoolInFlight++;
             const tStart = performance.now();
             const tx = await this.mempoolProvider.getTransaction(txHash);
             const tGotTx = performance.now();
@@ -181,11 +188,18 @@ export class CopyTradingService {
             const innerCode = error?.error?.code ?? error?.info?.error?.code;
             const topCode = error?.code;
             const messageStr = String(error?.error?.message || error?.message || error?.shortMessage || '');
-            if ((innerCode === 26 || topCode === 26 || messageStr.includes('Unknown block'))) {
+            if (
+              (innerCode === 26 || topCode === 26 || messageStr.includes('Unknown block')) ||
+              (innerCode === 30 || topCode === 30 || messageStr.includes('free tier')) ||
+              (innerCode === 19 || topCode === 19 || messageStr.includes('Unable to perform request'))
+            ) {
               // Transient mempool inconsistency
               return;
             }
             console.error('Error in mempool listener:', error);
+          }
+          finally {
+            this.mempoolInFlight = Math.max(0, this.mempoolInFlight - 1);
           }
         });
 
