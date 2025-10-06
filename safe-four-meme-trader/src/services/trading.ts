@@ -1,10 +1,9 @@
 import { encodeFunctionData, maxUint256 } from 'viem';
-import { performance } from 'node:perf_hooks';
 import { WalletService } from './wallet';
 import { ContractService } from './contracts';
 import { PancakeSwapService } from './pancakeSwap';
 import { ValidationUtils } from '../utils/validation';
-import { getCurrentGasPrice, publicClient, sendRawTransaction, getBalance } from '../utils/web3';
+import { getCurrentGasPrice, sendRawTransaction, getBalance } from '../utils/web3';
 import { NonceManager } from './nonceManager';
 import { 
   TOKEN_MANAGER_V1_ABI, 
@@ -38,7 +37,6 @@ export class TradingService {
     userId: string
   ): Promise<ApiResponse<{ txHash: string; successCount: number; totalWallets: number }>> {
     try {
-      const tStart = performance.now();
       // Validate input
       const validation = ValidationUtils.validateTransactionParams({
         tokenAddress,
@@ -65,12 +63,10 @@ export class TradingService {
       }
 
       // Check wallet balances and filter out wallets with insufficient funds
-      const tGasStart = performance.now();
       const gasPrice = await getCurrentGasPrice();
       const estimatedGasCost = gasPrice * BigInt(GAS_LIMITS.BUY);
       const totalRequiredAmount = BigInt(Math.floor(bnbAmountPerWallet * 1e18)) + estimatedGasCost;
       
-      const tBalanceStart = performance.now();
       const fundedWallets = [];
       for (const walletAddress of walletAddresses) {
         try {
@@ -84,7 +80,6 @@ export class TradingService {
           console.error(`Error checking balance for wallet ${walletAddress}:`, error);
         }
       }
-      console.log(`⏱ [buy] gasPrice+balance check: ${Math.round(performance.now() - tGasStart)}ms (balances: ${Math.round(performance.now() - tBalanceStart)}ms)`);
 
       if (fundedWallets.length === 0) {
         return {
@@ -97,9 +92,7 @@ export class TradingService {
       console.log(`💰 Using ${fundedWallets.length} funded wallets out of ${walletAddresses.length} total wallets`);
 
       // Check if token is migrated to PancakeSwap
-      const tMigStart = performance.now();
       const isMigrated = await this.isTokenMigrated(tokenAddress);
-      console.log(`⏱ [buy] migration check: ${Math.round(performance.now() - tMigStart)}ms`);
       if (isMigrated) {
         console.log(`🔄 Token ${tokenAddress.slice(0, 8)}... is migrated to PancakeSwap, using PancakeSwap service`);
         // Use PancakeSwap service for migrated tokens
@@ -107,7 +100,6 @@ export class TradingService {
       }
 
       // Validate token
-      const tTradableStart = performance.now();
       const tokenValidation = await ContractService.isTokenTradable(tokenAddress);
       if (!tokenValidation.isValid) {
         return {
@@ -119,14 +111,12 @@ export class TradingService {
 
       const tokenInfo = tokenValidation.info!;
       const buyParams = await ContractService.getBuyParams(tokenAddress, bnbAmountPerWallet.toString());
-      console.log(`⏱ [buy] tradable+params: ${Math.round(performance.now() - tTradableStart)}ms`);
 
       // Prepare transactions
       const transactions: string[] = [];
       const fromAddresses: string[] = [];
       let successCount = 0;
 
-      const tPrepareStart = performance.now();
       for (const walletAddress of fundedWallets) {
         try {
           const walletClient = WalletService.createWalletClient(userId, walletAddress);
@@ -182,7 +172,6 @@ export class TradingService {
           // Continue with other wallets
         }
       }
-      console.log(`⏱ [buy] prepare ${transactions.length} tx(s): ${Math.round(performance.now() - tPrepareStart)}ms`);
 
       if (transactions.length === 0) {
         return {
@@ -194,9 +183,6 @@ export class TradingService {
 
       // Submit bundle
       const bundleResult = await this.submitBundle(transactions, fromAddresses);
-      const tSubmitStart = performance.now();
-      const bundleResult = await this.submitBundle(transactions);
-      console.log(`⏱ [buy] submit bundle: ${Math.round(performance.now() - tSubmitStart)}ms, total: ${Math.round(performance.now() - tStart)}ms`);
 
       return {
         success: bundleResult.success,
@@ -228,7 +214,6 @@ export class TradingService {
     userId: string
   ): Promise<ApiResponse<{ txHash: string; successCount: number; totalWallets: number }>> {
     try {
-      const tStart = performance.now();
       // Validate input
       const validation = ValidationUtils.validateTransactionParams({
         tokenAddress,
@@ -255,9 +240,7 @@ export class TradingService {
       }
 
       // Check if token is migrated to PancakeSwap
-      const tMigStart = performance.now();
       const isMigrated = await this.isTokenMigrated(tokenAddress);
-      console.log(`⏱ [sell] migration check: ${Math.round(performance.now() - tMigStart)}ms`);
       if (isMigrated) {
         console.log(`🔄 Token ${tokenAddress.slice(0, 8)}... is migrated to PancakeSwap, using PancakeSwap service`);
         // Use PancakeSwap service for migrated tokens
@@ -265,7 +248,6 @@ export class TradingService {
       }
 
       // Validate token
-      // const tTradableStart = performance.now();
       const tokenValidation = await ContractService.isTokenTradable(tokenAddress);
       if (!tokenValidation.isValid) {
         return {
@@ -282,7 +264,6 @@ export class TradingService {
       const fromAddresses: string[] = [];
       let successCount = 0;
 
-      const tPrepareStart = performance.now();
       for (const walletAddress of walletAddresses) {
         try {
           const walletClient = WalletService.createWalletClient(userId, walletAddress);
@@ -384,7 +365,6 @@ export class TradingService {
           // Continue with other wallets
         }
       }
-      console.log(`⏱ [sell] prepare ${transactions.length} tx(s): ${Math.round(performance.now() - tPrepareStart)}ms`);
 
       if (transactions.length === 0) {
         return {
@@ -398,9 +378,6 @@ export class TradingService {
 
       // Submit bundle
       const bundleResult = await this.submitBundle(transactions, fromAddresses);
-      const tSubmitStart = performance.now();
-      const bundleResult = await this.submitBundle(transactions);
-      console.log(`⏱ [sell] submit bundle: ${Math.round(performance.now() - tSubmitStart)}ms, total: ${Math.round(performance.now() - tStart)}ms`);
 
       return {
         success: bundleResult.success,
@@ -596,7 +573,6 @@ export class TradingService {
       
       const results = [];
       let successCount = 0;
-      const tStart = performance.now();
       
       for (let i = 0; i < transactions.length; i++) {
         try {
@@ -604,10 +580,10 @@ export class TradingService {
           const signedTx = `0x${transactions[i]}`;
           
           console.log(`📤 Submitting transaction ${i + 1}: ${signedTx.slice(0, 20)}...`);
-          const tSend = performance.now();
+          
           // Submit transaction to the network
           const txHash = await sendRawTransaction(signedTx as `0x${string}`);
-          console.log(`⏱ [submit] tx ${i + 1} sent in ${Math.round(performance.now() - tSend)}ms`);
+          
           console.log(`✅ Transaction ${i + 1} submitted successfully: ${txHash}`);
           results.push({ success: true, txHash });
           successCount++;
@@ -629,7 +605,6 @@ export class TradingService {
           results.push({ success: false, error: errMsg });
         }
       }
-      console.log(`⏱ [submit] total submit time: ${Math.round(performance.now() - tStart)}ms`);
       
       if (successCount === 0) {
         return {
