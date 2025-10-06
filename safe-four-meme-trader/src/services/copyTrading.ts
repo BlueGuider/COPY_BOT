@@ -387,7 +387,8 @@ export class CopyTradingService {
 
       // Parse transaction data to determine if it's a buy or sell
       console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Parsing transaction data...`);
-      console.log(`   📊 Transaction details: from=${tx.from}, to=${tx.to}, value=${tx.value}, input=${tx.input?.slice(0, 10)}...`);
+      const inputPreview = (tx as any).input ?? (tx as any).data ?? '';
+      console.log(`   📊 Transaction details: from=${tx.from}, to=${tx.to}, value=${tx.value}, input=${String(inputPreview).slice(0, 10)}...`);
       
       let tradeInfo = await this.parseTransactionData(tx, { allowReceiptLookup });
       if (!tradeInfo) {
@@ -583,7 +584,7 @@ export class CopyTradingService {
   } | null> {
     try {
       const bnbAmount = Number(tx.value) / 1e18;
-      const inputData = tx.input;
+      const inputData = (tx as any).input ?? (tx as any).data;
       
       // Validate transaction data
       if (!tx.to || !tx.from) {
