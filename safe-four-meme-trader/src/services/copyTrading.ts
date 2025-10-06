@@ -11,8 +11,9 @@ import { TelegramBotService } from './telegramBot';
 import { PriceTrackingService } from './priceTrackingService';
 import { DirectPriceService } from './directPriceService';
 import { CSVLogger } from './csvLogger';
-import { config } from '../config';
+import { config, CONTRACT_ADDRESSES } from '../config';
 import { ethers } from 'ethers';
+import { performance } from 'node:perf_hooks';
 
 export interface CopyTradingConfig {
   targetWallet: string;
@@ -129,7 +130,9 @@ export class CopyTradingService {
 
         this.mempoolProvider.on('pending', async (txHash: string) => {
           try {
+            const tStart = performance.now();
             const tx = await this.mempoolProvider.getTransaction(txHash);
+            const tGotTx = performance.now();
             if (!tx) return;
 
             const fromAddress = tx.from?.toLowerCase();
@@ -158,6 +161,8 @@ export class CopyTradingService {
                 await this.analyzeAndCopyTransaction(userId, cfg, tx, { allowReceiptLookup: false });
               }
             }
+
+            console.log(`⏱ [mempool] getTx: ${Math.round(tGotTx - tStart)}ms, total pending handler: ${Math.round(performance.now() - tStart)}ms`);
 
           } catch (error: any) {
             const innerCode = error?.error?.code ?? error?.info?.error?.code;
@@ -390,7 +395,10 @@ export class CopyTradingService {
       const inputPreview = (tx as any).input ?? (tx as any).data ?? '';
       console.log(`   📊 Transaction details: from=${tx.from}, to=${tx.to}, value=${tx.value}, input=${String(inputPreview).slice(0, 10)}...`);
       
+      const tParseStart = performance.now();
       let tradeInfo = await this.parseTransactionData(tx, { allowReceiptLookup });
+      const tParseEnd = performance.now();
+      console.log(`   ⏱ [mempool] parse: ${Math.round(tParseEnd - tParseStart)}ms (pending=${!allowReceiptLookup})`);
       if (!tradeInfo) {
         if (allowReceiptLookup) {
           console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Could not parse trade data, trying internal transaction analysis`);
@@ -419,7 +427,9 @@ export class CopyTradingService {
 
       // Determine trading platform and validate accordingly
       console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Determining trading platform for token ${tradeInfo.tokenAddress}...`);
+      const tPlatStart = performance.now();
       const platformInfo = await this.determineTradingPlatform(tradeInfo.tokenAddress);
+      console.log(`   ⏱ [mempool] platform: ${Math.round(performance.now() - tPlatStart)}ms`);
       console.log(`   📊 Transaction ${tx.hash?.slice(0, 10)}...: Platform: ${platformInfo.platform}, Tradeable: ${platformInfo.isTradeable}`);
       
       if (!platformInfo.isTradeable) {
@@ -585,6 +595,12 @@ export class CopyTradingService {
     try {
       const bnbAmount = Number(tx.value) / 1e18;
       const inputData = (tx as any).input ?? (tx as any).data;
+      const wbnb = CONTRACT_ADDRESSES.WBNB.toLowerCase();
+      const isBNBorWBNB = (addr?: string) => {
+        if (!addr) return false;
+        const a = addr.toLowerCase();
+        return a === '0x0000000000000000000000000000000000000000' || a === wbnb;
+      };
       
       // Validate transaction data
       if (!tx.to || !tx.from) {
@@ -682,11 +698,10 @@ export class CopyTradingService {
           const [tokenIn, tokenOut, amountIn, _amountOutMin, _poolAddress] = decoded.args as [string, string, bigint, bigint, string];
           
           // Determine if it's a buy or sell based on token addresses
-          // If tokenIn is BNB (0x0000...0000) and tokenOut is a token, it's a BUY
-          // If tokenIn is a token and tokenOut is BNB, it's a SELL
-          const isBNB = tokenIn === '0x0000000000000000000000000000000000000000';
+          const isNativeIn = isBNBorWBNB(tokenIn);
+          const isNativeOut = isBNBorWBNB(tokenOut);
           
-          if (isBNB) {
+          if (isNativeIn && !isNativeOut) {
             // BUY: BNB -> Token - need to get actual token amount from logs
             const tokenAmount = await this.getTokenAmountFromLogs(tx, tokenOut.toLowerCase());
             return {
@@ -695,12 +710,20 @@ export class CopyTradingService {
               bnbAmount,
               tokenAmount: tokenAmount || Number(amountIn) / 1e18 // Fallback to amountIn if logs fail
             };
-          } else {
+          } else if (!isNativeIn && isNativeOut) {
             // SELL: Token -> BNB
             return {
               type: 'SELL',
               tokenAddress: tokenIn.toLowerCase(),
               bnbAmount: 0, // Sell transactions don't send BNB
+              tokenAmount: Number(amountIn) / 1e18
+            };
+          } else {
+            // Token to token swap
+            return {
+              type: 'SELL',
+              tokenAddress: tokenIn.toLowerCase(),
+              bnbAmount: 0,
               tokenAmount: Number(amountIn) / 1e18
             };
           }
@@ -712,9 +735,10 @@ export class CopyTradingService {
           console.log(`   🔍 swapV3ExactIn: ${tokenIn} -> ${tokenOut}, amount: ${amountIn}`);
           
           // Determine if it's a buy or sell based on token addresses
-          const isBNB = tokenIn === '0x0000000000000000000000000000000000000000';
+          const isNativeIn = isBNBorWBNB(tokenIn);
+          const isNativeOut = isBNBorWBNB(tokenOut);
           
-          if (isBNB) {
+          if (isNativeIn && !isNativeOut) {
             // BUY: BNB -> Token - need to get actual token amount from logs
             const tokenAmount = await this.getTokenAmountFromLogs(tx, tokenOut.toLowerCase());
             return {
@@ -723,8 +747,16 @@ export class CopyTradingService {
               bnbAmount,
               tokenAmount: tokenAmount || Number(amountIn) / 1e18 // Fallback to amountIn if logs fail
             };
-          } else {
+          } else if (!isNativeIn && isNativeOut) {
             // SELL: Token -> BNB
+            return {
+              type: 'SELL',
+              tokenAddress: tokenIn.toLowerCase(),
+              bnbAmount: 0,
+              tokenAmount: Number(amountIn) / 1e18
+            };
+          } else {
+            // Token to token swap
             return {
               type: 'SELL',
               tokenAddress: tokenIn.toLowerCase(),
@@ -744,8 +776,8 @@ export class CopyTradingService {
           const firstToken = path[0];
           const lastToken = path[path.length - 1];
           
-          const isBNBIn = firstToken === '0x0000000000000000000000000000000000000000';
-          const isBNBOut = lastToken === '0x0000000000000000000000000000000000000000';
+          const isBNBIn = isBNBorWBNB(firstToken);
+          const isBNBOut = isBNBorWBNB(lastToken);
           
           if (isBNBIn && !isBNBOut) {
             // BUY: BNB -> Token - need to get actual token amount from logs
@@ -782,7 +814,7 @@ export class CopyTradingService {
           
           console.log(`   🔍 swapV2MultiHopExactIn: ${tokenIn} -> ${path[path.length - 1]}, amount: ${amountIn}`);
           
-          const isBNB = tokenIn === '0x0000000000000000000000000000000000000000';
+          const isBNB = isBNBorWBNB(tokenIn);
           const lastToken = path[path.length - 1];
           
           if (isBNB) {
@@ -816,8 +848,8 @@ export class CopyTradingService {
             const firstToken = path[0];
             const lastToken = path[path.length - 1];
             
-            const isBNBIn = firstToken === '0x0000000000000000000000000000000000000000';
-            const isBNBOut = lastToken === '0x0000000000000000000000000000000000000000';
+          const isBNBIn = isBNBorWBNB(firstToken);
+          const isBNBOut = isBNBorWBNB(lastToken);
             
             if (isBNBIn && !isBNBOut) {
               // BUY: BNB -> Token - need to get actual token amount from logs
@@ -937,8 +969,8 @@ export class CopyTradingService {
             console.log(`   📝 Last swap: ${lastSwap.tokenIn} -> ${lastSwap.tokenOut}`);
             
             // Determine if it's a buy or sell based on the swap path
-            const isBNBIn = firstSwap.tokenIn === '0x0000000000000000000000000000000000000000';
-            const isBNBOut = lastSwap.tokenOut === '0x0000000000000000000000000000000000000000';
+            const isBNBIn = isBNBorWBNB(firstSwap.tokenIn);
+            const isBNBOut = isBNBorWBNB(lastSwap.tokenOut);
             
             if (isBNBIn && !isBNBOut) {
               // BUY: BNB -> Token - need to get actual token amount from logs
