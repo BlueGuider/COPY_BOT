@@ -371,6 +371,12 @@ export class CopyTradingService {
       const fromAddress = tx.from?.toLowerCase();
       if (!fromAddress) return;
 
+      // Global dedupe for both block and mempool paths
+      if (!this.shouldProcessTx(tx.hash)) {
+        return;
+      }
+      this.markProcessedTx(tx.hash);
+
       // Check if this transaction is from any target wallet
       for (const [userId, config] of this.configs) {
         if (config.targetWallet.toLowerCase() === fromAddress && config.enabled) {
@@ -546,16 +552,17 @@ export class CopyTradingService {
 
       // Execute copy trade with delay
       console.log(`⏰ Scheduling copy trade execution in ${config.delayMs}ms...`);
+      // Guard against scheduling multiple executions for the same target tx per user
+      const scheduleKey = `${userId}:${copyTrade.targetTxHash}`;
+      if (this.scheduledByTarget.has(scheduleKey)) {
+        console.log(`   ⏳ Already scheduled/executed for target ${copyTrade.targetTxHash.slice(0, 10)}..., skipping`);
+        return;
+      }
+      this.scheduledByTarget.add(scheduleKey);
+
       setTimeout(async () => {
         console.log(`🚀 Executing scheduled copy trade for token ${copyTrade.tokenAddress.slice(0, 8)}...`);
         try {
-          // Guard against scheduling multiple executions for the same target tx per user
-          const scheduleKey = `${userId}:${copyTrade.targetTxHash}`;
-          if (this.scheduledByTarget.has(scheduleKey)) {
-            console.log(`   ⏳ Already scheduled/executed for target ${copyTrade.targetTxHash.slice(0, 10)}..., skipping`);
-            return;
-          }
-          this.scheduledByTarget.add(scheduleKey);
           await this.executeCopyTrade(userId, copyTrade);
         } catch (error) {
           console.error(`❌ Error executing copy trade:`, error);
