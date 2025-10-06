@@ -1013,15 +1013,25 @@ export class CopyTradingService {
           return await this.analyzeInternalTransactions(tx);
         }
       } catch (swapXError) {
-        // Not a SwapX function either - try internal transaction analysis
+        // Not a SwapX function either - optionally try internal transaction analysis
         console.log(`   ⚠️  SwapX function decoding failed: ${(swapXError as Error).message}`);
-        console.log(`   🔍 Trying internal transaction analysis...`);
-        return await this.analyzeInternalTransactions(tx);
+        const allowReceiptLookup = opts?.allowReceiptLookup ?? true;
+        if (allowReceiptLookup) {
+          console.log(`   🔍 Trying internal transaction analysis...`);
+          return await this.analyzeInternalTransactions(tx);
+        }
+        return null;
       }
 
       // If we get here, it's not a recognized trading function
-      // Try to analyze using internal transactions and token transfers
-      return await this.analyzeInternalTransactions(tx);
+      // Try to analyze using internal transactions and token transfers (only if receipt lookup allowed)
+      {
+        const allowReceiptLookup = opts?.allowReceiptLookup ?? true;
+        if (allowReceiptLookup) {
+          return await this.analyzeInternalTransactions(tx);
+        }
+        return null;
+      }
     } catch (error) {
       console.error('Error parsing transaction data:', error);
       return null;
