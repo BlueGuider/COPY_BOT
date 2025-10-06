@@ -401,6 +401,7 @@ export class CopyTradingService {
     opts?: { allowReceiptLookup?: boolean }
   ): Promise<void> {
     try {
+      const modeLabel = (config_1.config?.monitoring?.mode === 'mempool') ? '[mempool]' : '[block]';
       const allowReceiptLookup = opts?.allowReceiptLookup ?? true;
       const toAddress = tx.to?.toLowerCase();
       if (!toAddress) {
@@ -422,11 +423,15 @@ export class CopyTradingService {
       const shownInput = (tx as any).input ?? (tx as any).data;
       console.log(`   📊 Transaction details: from=${tx.from}, to=${tx.to}, value=${tx.value}, input=${shownInput ? String(shownInput).slice(0, 10) : 'undefined'}...`);
       
+      const tParseStart = Date.now();
       let tradeInfo = await this.parseTransactionData(tx, { allowReceiptLookup });
+      console.log(`   ⏱ ${modeLabel} parse: ${Date.now() - tParseStart}ms (pending=${!allowReceiptLookup})`);
       if (!tradeInfo) {
         if (allowReceiptLookup) {
           console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Could not parse trade data, trying internal transaction analysis`);
+          const tInternalStart = Date.now();
           tradeInfo = await this.analyzeInternalTransactions(tx);
+          console.log(`   ⏱ ${modeLabel} internal: ${Date.now() - tInternalStart}ms`);
           if (!tradeInfo) {
             console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Could not determine trade type from internal transactions`);
             return;
@@ -451,7 +456,9 @@ export class CopyTradingService {
 
       // Determine trading platform and validate accordingly
       console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Determining trading platform for token ${tradeInfo.tokenAddress}...`);
+      const tPlatStart = Date.now();
       const platformInfo = await this.determineTradingPlatform(tradeInfo.tokenAddress);
+      console.log(`   ⏱ ${modeLabel} platform: ${Date.now() - tPlatStart}ms`);
       console.log(`   📊 Transaction ${tx.hash?.slice(0, 10)}...: Platform: ${platformInfo.platform}, Tradeable: ${platformInfo.isTradeable}`);
       
       if (!platformInfo.isTradeable) {
@@ -556,6 +563,9 @@ export class CopyTradingService {
 
       // Execute copy trade with delay
       console.log(`⏰ Scheduling copy trade execution in ${config.delayMs}ms...`);
+      if (config.delayMs && config.delayMs > 0) {
+        console.log(`   ⏱ ${modeLabel} delay: ${config.delayMs}ms`);
+      }
       // Guard against scheduling multiple executions for the same target tx per user
       const scheduleKey = `${userId}:${copyTrade.targetTxHash}`;
       if (this.scheduledByTarget.has(scheduleKey)) {
