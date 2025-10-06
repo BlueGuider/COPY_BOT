@@ -619,7 +619,9 @@ export class CopyTradingService {
       // SwapX contract (proxy) - Main contract for trading
       '0x1de460f363af910f51726def188f9004276bf4bc',
       // SwapX implementation
-      '0x7c7ae3868d969b57b7a47fd5cba8899df1f3d564'
+      '0x7c7ae3868d969b57b7a47fd5cba8899df1f3d564',
+      // Dragun router (bot service)
+      '0xca980f000771f70b15647069e9e541ef73f71f2f'
     ];
 
     const lowerAddress = address.toLowerCase();
