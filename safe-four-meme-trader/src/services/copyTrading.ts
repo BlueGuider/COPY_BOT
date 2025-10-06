@@ -156,6 +156,19 @@ export class CopyTradingService {
             }
             if (!proceed) return;
 
+            // Skip non-trading ERC20 ops in mempool (e.g., approve/increaseAllowance/permit)
+            const inputData = (tx as any).input ?? (tx as any).data ?? '';
+            const selector = typeof inputData === 'string' ? inputData.slice(0, 10).toLowerCase() : '';
+            const skipSelectors = new Set([
+              '0x095ea7b3', // approve(address,uint256)
+              '0x39509351', // increaseAllowance(address,uint256)
+              '0xd505accf'  // permit(...)
+            ]);
+            if (skipSelectors.has(selector)) {
+              console.log(`   🔍 Skipping non-trade ERC20 method (${selector}) in mempool`);
+              return;
+            }
+
             for (const [userId, cfg] of this.configs) {
               if (cfg.enabled && cfg.targetWallet.toLowerCase() === fromAddress) {
                 await this.analyzeAndCopyTransaction(userId, cfg, tx, { allowReceiptLookup: false });
@@ -1009,8 +1022,12 @@ export class CopyTradingService {
           };
         } else {
           console.log(`   ⚠️  Unknown SwapX function: ${decoded.functionName}`);
-          // Try to analyze using internal transactions for unknown functions
-          return await this.analyzeInternalTransactions(tx);
+          const allowReceiptLookup = opts?.allowReceiptLookup ?? true;
+          if (allowReceiptLookup) {
+            // Try to analyze using internal transactions for unknown functions
+            return await this.analyzeInternalTransactions(tx);
+          }
+          return null;
         }
       } catch (swapXError) {
         // Not a SwapX function either - optionally try internal transaction analysis
