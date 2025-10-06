@@ -37,16 +37,16 @@ const BSC_RPC_ENDPOINTS = [
 const createTransport = () => {
   const transports = BSC_RPC_ENDPOINTS.map(url => 
     http(url, {
-      timeout: 2000, // 2 second timeout for faster execution
-      retryCount: 1, // Reduce retries per endpoint for faster fallback
-      retryDelay: 200 // Faster retry delay
+      timeout: 1200, // tighter timeout for lower latency
+      retryCount: 0, // do not retry per endpoint, let fallback handle it
+      retryDelay: 100 // short delay if any
     })
   );
   
   return fallback(transports, {
     rank: false, // Don't rank by response time - use order in array
-    retryCount: 1, // Reduce total retries for faster failover
-    retryDelay: 500 // Faster fallback between endpoints
+    retryCount: 1, // minimal retries across transports
+    retryDelay: 150 // quicker fallback between endpoints
   });
 };
 
@@ -86,7 +86,7 @@ export const retryWithBackoff = async <T>(
       // Don't retry on certain errors
       if (error instanceof Error) {
         if (error.message.includes('insufficient funds') || 
-            error.message.includes('nonce') ||
+            error.message.toLowerCase().includes('nonce') ||
             error.message.includes('invalid signature') ||
             error.message.includes('already known') ||
             error.message.includes('replacement transaction underpriced')) {
@@ -129,6 +129,7 @@ export const getCurrentGasPrice = async (): Promise<bigint> => {
     adjustedGasPrice = Math.max(adjustedGasPrice, minGasPrice);
     adjustedGasPrice = Math.min(adjustedGasPrice, maxGasPrice);
     
+    // Less verbose during hot paths
     console.log(`Adjusted gas price: ${adjustedGasPrice} gwei (multiplier: ${multiplier})`);
     
     return BigInt(Math.floor(adjustedGasPrice * 1e9));
@@ -149,7 +150,8 @@ export const getCurrentBlockNumber = async (): Promise<bigint> => {
  */
 export const getTransactionCount = async (address: `0x${string}`): Promise<number> => {
   return retryWithBackoff(async () => {
-    return await publicClient.getTransactionCount({ address });
+    // Use pending to include queued transactions, reducing nonce-too-low errors
+    return await publicClient.getTransactionCount({ address, blockTag: 'pending' });
   });
 };
 
@@ -205,7 +207,7 @@ export const getBlockTimestamp = async (blockNumber: bigint): Promise<bigint> =>
 export const sendRawTransaction = async (serializedTransaction: `0x${string}`): Promise<`0x${string}`> => {
   return retryWithBackoff(async () => {
     return await publicClient.sendRawTransaction({ serializedTransaction });
-  });
+  }, 2, 400);
 };
 
 /**

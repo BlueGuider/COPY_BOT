@@ -4,6 +4,7 @@ import { ContractService } from './contracts';
 import { PancakeSwapService } from './pancakeSwap';
 import { ValidationUtils } from '../utils/validation';
 import { getCurrentGasPrice, publicClient, sendRawTransaction, getBalance } from '../utils/web3';
+import { NonceManager } from './nonceManager';
 import { 
   TOKEN_MANAGER_V1_ABI, 
   TOKEN_MANAGER_V2_ABI, 
@@ -113,13 +114,16 @@ export class TradingService {
 
       // Prepare transactions
       const transactions: string[] = [];
+      const fromAddresses: string[] = [];
       let successCount = 0;
 
       for (const walletAddress of fundedWallets) {
         try {
           const walletClient = WalletService.createWalletClient(userId, walletAddress);
-          let nonce = await publicClient.getTransactionCount({ address: walletAddress as `0x${string}` });
-          const gasPrice = await getCurrentGasPrice();
+          const [nonce, gasPrice] = await Promise.all([
+            NonceManager.getNextNonce(walletAddress as `0x${string}`),
+            getCurrentGasPrice()
+          ]);
 
           // Encode transaction data
           let transactionData: `0x${string}`;
@@ -157,6 +161,7 @@ export class TradingService {
           });
 
           transactions.push(signature.slice(2)); // Remove 0x prefix
+          fromAddresses.push(walletAddress);
           successCount++;
 
           // Update wallet last used
@@ -177,7 +182,7 @@ export class TradingService {
       }
 
       // Submit bundle
-      const bundleResult = await this.submitBundle(transactions);
+      const bundleResult = await this.submitBundle(transactions, fromAddresses);
 
       return {
         success: bundleResult.success,
@@ -256,13 +261,17 @@ export class TradingService {
 
       // Prepare transactions
       const transactions: string[] = [];
+      const fromAddresses: string[] = [];
       let successCount = 0;
 
       for (const walletAddress of walletAddresses) {
         try {
           const walletClient = WalletService.createWalletClient(userId, walletAddress);
-          let nonce = await publicClient.getTransactionCount({ address: walletAddress as `0x${string}` });
-          const gasPrice = await getCurrentGasPrice();
+          const [nonceInitial, gasPrice] = await Promise.all([
+            NonceManager.getNextNonce(walletAddress as `0x${string}`),
+            getCurrentGasPrice()
+          ]);
+          let nonce = nonceInitial;
 
           // Get token balance
           const balance = await ContractService.getTokenBalance(tokenAddress, walletAddress);
@@ -303,7 +312,9 @@ export class TradingService {
             });
 
             transactions.push(approveSignature.slice(2));
-            nonce++;
+            fromAddresses.push(walletAddress);
+            // Reserve the next nonce for the subsequent sell transaction
+            nonce = await NonceManager.getNextNonce(walletAddress as `0x${string}`);
           }
 
           // Encode sell transaction
@@ -343,6 +354,7 @@ export class TradingService {
           console.log(`   Nonce: ${nonce}`);
 
           transactions.push(sellSignature.slice(2));
+          fromAddresses.push(walletAddress);
           successCount++;
 
           // Update wallet last used
@@ -365,7 +377,7 @@ export class TradingService {
       console.log(`📦 Submitting ${transactions.length} sell transaction(s)`);
 
       // Submit bundle
-      const bundleResult = await this.submitBundle(transactions);
+      const bundleResult = await this.submitBundle(transactions, fromAddresses);
 
       return {
         success: bundleResult.success,
@@ -552,7 +564,7 @@ export class TradingService {
   /**
    * Submit transaction bundle for MEV protection
    */
-  private static async submitBundle(transactions: string[]): Promise<BundleResult> {
+  private static async submitBundle(transactions: string[], fromAddresses?: string[]): Promise<BundleResult> {
     try {
       console.log(`Submitting bundle with ${transactions.length} transactions`);
       
@@ -576,13 +588,21 @@ export class TradingService {
           results.push({ success: true, txHash });
           successCount++;
           
-          // Wait a bit between transactions to avoid nonce issues
-          await new Promise(resolve => setTimeout(resolve, 200)); // Reduced from 1000ms to 200ms
+          // Short spacing between tx submissions
+          await new Promise(resolve => setTimeout(resolve, 50));
           
         } catch (error) {
-          console.error(`❌ Error submitting transaction ${i + 1}:`, error);
+          const errMsg = (error as Error).message || String(error);
+          console.error(`❌ Error submitting transaction ${i + 1}:`, errMsg);
           console.error(`   Transaction data: ${transactions[i].slice(0, 50)}...`);
-          results.push({ success: false, error: (error as Error).message });
+          // If nonce error patterns, resync nonces for this wallet to catch up
+          if (fromAddresses && /nonce too low|invalid nonce|already known/i.test(errMsg)) {
+            const addr = fromAddresses[i];
+            if (addr) {
+              try { await NonceManager.resync(addr as `0x${string}`); } catch {}
+            }
+          }
+          results.push({ success: false, error: errMsg });
         }
       }
       
