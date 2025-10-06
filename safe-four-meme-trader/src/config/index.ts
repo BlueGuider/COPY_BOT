@@ -79,6 +79,17 @@ export const config = {
     maxSlippage: parseFloat(process.env.AUTO_TRADING_MAX_SLIPPAGE || '5'), // percentage
     minOrderAmount: parseFloat(process.env.AUTO_TRADING_MIN_AMOUNT || '0.001'), // BNB
     maxOrderAmount: parseFloat(process.env.AUTO_TRADING_MAX_AMOUNT || '1.0') // BNB
+  } as any,
+
+  // Monitoring Configuration
+  monitoring: {
+    // 'block' (poll JSON-RPC blocks) or 'mempool' (listen to pending txs)
+    mode: (process.env.MONITORING_MODE || 'block').toLowerCase(),
+    // Block polling interval in ms
+    blockPollingIntervalMs: parseInt(process.env.BLOCK_POLL_INTERVAL_MS || '300'),
+    // WebSocket URL for mempool monitoring (optional)
+    // If not set, will fall back to a public DRPC WS endpoint
+    wsUrl: process.env.BSC_WS_URL || 'wss://lb.drpc.live/bsc/AqI3Ie1juUWKoPU70_eGdMDb-J5BomIR8IEIwg8TMB_n'
   } as any
 };
 

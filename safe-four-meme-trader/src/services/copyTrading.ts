@@ -11,6 +11,8 @@ import { TelegramBotService } from './telegramBot';
 import { PriceTrackingService } from './priceTrackingService';
 import { DirectPriceService } from './directPriceService';
 import { CSVLogger } from './csvLogger';
+import { config } from '../config';
+import { ethers } from 'ethers';
 
 export interface CopyTradingConfig {
   targetWallet: string;
@@ -50,6 +52,7 @@ export class CopyTradingService {
   private static testingMode = false; // Set to false to enable actual trading
   private static priceTrackingService: PriceTrackingService = PriceTrackingService.getInstance();
   private static csvLogger: CSVLogger = CSVLogger.getInstance();
+  private static mempoolProvider: any | null = null;
 
   /**
    * Setup copy trading for a user
@@ -111,19 +114,82 @@ export class CopyTradingService {
     if (this.isMonitoring) return;
 
     this.isMonitoring = true;
+    const monitoringMode = config.monitoring?.mode === 'mempool' ? 'mempool' : 'block';
     console.log('🚀 Copy trading monitoring started');
     console.log(`📊 Monitoring ${this.configs.size} target wallet(s)`);
     console.log(`🧪 Mode: ${this.testingMode ? 'SIMULATION' : 'LIVE TRADING'}`);
+    console.log(`🔌 Monitoring mode: ${monitoringMode}`);
     console.log('');
 
-    // Poll every 300ms for new transactions (faster response)
-    this.monitoringInterval = setInterval(async () => {
+    if (monitoringMode === 'mempool') {
+      // Start mempool (pending tx) monitoring via WebSocket
+      const wsUrl = config.monitoring?.wsUrl;
       try {
-        await this.checkForNewTransactions();
+        this.mempoolProvider = new ethers.WebSocketProvider(wsUrl);
+
+        this.mempoolProvider.on('pending', async (txHash: string) => {
+          try {
+            const tx = await this.mempoolProvider.getTransaction(txHash);
+            if (!tx) return;
+
+            const fromAddress = tx.from?.toLowerCase();
+            if (!fromAddress) return;
+
+            const targetWallets = Array.from(this.configs.values()).map(c => c.targetWallet);
+            if (!targetWallets.includes(fromAddress)) return;
+
+            const toAddress = tx.to?.toLowerCase();
+            if (!toAddress) return;
+
+            // Quick pre-filter: only proceed if to is known trading contract or token contract
+            const isKnown = await this.isKnownTradingContract(toAddress);
+            let proceed = isKnown;
+            if (!proceed) {
+              try {
+                proceed = await this.isTokenContract(toAddress);
+              } catch (_) {
+                proceed = false;
+              }
+            }
+            if (!proceed) return;
+
+            for (const [userId, cfg] of this.configs) {
+              if (cfg.enabled && cfg.targetWallet.toLowerCase() === fromAddress) {
+                await this.analyzeAndCopyTransaction(userId, cfg, tx, { allowReceiptLookup: false });
+              }
+            }
+
+          } catch (error: any) {
+            const innerCode = error?.error?.code ?? error?.info?.error?.code;
+            const topCode = error?.code;
+            const messageStr = String(error?.error?.message || error?.message || error?.shortMessage || '');
+            if ((innerCode === 26 || topCode === 26 || messageStr.includes('Unknown block'))) {
+              // Transient mempool inconsistency
+              return;
+            }
+            console.error('Error in mempool listener:', error);
+          }
+        });
+
+        this.mempoolProvider.on('error', (err: any) => {
+          console.error('WebSocket Provider error:', err);
+        });
       } catch (error) {
-        console.error('Error in copy trading monitoring:', error);
+        console.error('Failed to start mempool monitoring, falling back to block mode:', error);
       }
-    }, 300);
+    }
+
+    if (monitoringMode === 'block' || !this.mempoolProvider) {
+      // Poll JSON-RPC blocks
+      const intervalMs = config.monitoring?.blockPollingIntervalMs ?? 300;
+      this.monitoringInterval = setInterval(async () => {
+        try {
+          await this.checkForNewTransactions();
+        } catch (error) {
+          console.error('Error in copy trading monitoring:', error);
+        }
+      }, intervalMs);
+    }
   }
 
   /**
@@ -166,6 +232,18 @@ export class CopyTradingService {
     if (this.monitoringInterval) {
       clearInterval(this.monitoringInterval);
       this.monitoringInterval = null;
+    }
+    if (this.mempoolProvider) {
+      try {
+        // Best-effort cleanup for websocket provider
+        if (typeof this.mempoolProvider.removeAllListeners === 'function') {
+          this.mempoolProvider.removeAllListeners();
+        }
+        if (typeof this.mempoolProvider.destroy === 'function') {
+          this.mempoolProvider.destroy();
+        }
+      } catch (_) {}
+      this.mempoolProvider = null;
     }
     this.isMonitoring = false;
     console.log('Copy trading monitoring stopped');
@@ -287,9 +365,11 @@ export class CopyTradingService {
   private static async analyzeAndCopyTransaction(
     userId: string,
     config: CopyTradingConfig,
-    tx: any
+    tx: any,
+    opts?: { allowReceiptLookup?: boolean }
   ): Promise<void> {
     try {
+      const allowReceiptLookup = opts?.allowReceiptLookup ?? true;
       const toAddress = tx.to?.toLowerCase();
       if (!toAddress) {
         console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: No 'to' address`);
@@ -309,12 +389,18 @@ export class CopyTradingService {
       console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Parsing transaction data...`);
       console.log(`   📊 Transaction details: from=${tx.from}, to=${tx.to}, value=${tx.value}, input=${tx.input?.slice(0, 10)}...`);
       
-      let tradeInfo = await this.parseTransactionData(tx);
+      let tradeInfo = await this.parseTransactionData(tx, { allowReceiptLookup });
       if (!tradeInfo) {
-        console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Could not parse trade data, trying internal transaction analysis`);
-        tradeInfo = await this.analyzeInternalTransactions(tx);
-        if (!tradeInfo) {
-          console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Could not determine trade type from internal transactions`);
+        if (allowReceiptLookup) {
+          console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Could not parse trade data, trying internal transaction analysis`);
+          tradeInfo = await this.analyzeInternalTransactions(tx);
+          if (!tradeInfo) {
+            console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Could not determine trade type from internal transactions`);
+            return;
+          }
+        } else {
+          // Pending tx path: skip internal tx analysis (needs receipt)
+          console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Could not parse pending tx data, skipping`);
           return;
         }
       }
@@ -489,7 +575,7 @@ export class CopyTradingService {
   /**
    * Parse transaction data to extract trade information
    */
-  public static async parseTransactionData(tx: any): Promise<{
+  public static async parseTransactionData(tx: any, opts?: { allowReceiptLookup?: boolean }): Promise<{
     type: 'BUY' | 'SELL';
     tokenAddress: string;
     bnbAmount: number;
@@ -506,8 +592,13 @@ export class CopyTradingService {
       }
       
       if (!inputData || inputData === '0x') {
-        // Try to analyze using internal transactions and token transfers
-        return await this.analyzeInternalTransactions(tx);
+        // For pending transactions, the receipt is not yet available
+        const allowReceiptLookup = opts?.allowReceiptLookup ?? true;
+        if (allowReceiptLookup) {
+          // Try to analyze using internal transactions and token transfers
+          return await this.analyzeInternalTransactions(tx);
+        }
+        return null;
       }
 
       // Try to decode as V1 TokenManager function

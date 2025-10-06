@@ -4,21 +4,36 @@ async function main() {
   const wsUrl = 'wss://lb.drpc.live/bsc/AqI3Ie1juUWKoPU70_eGdMDb-J5BomIR8IEIwg8TMB_n';
   const provider = new ethers.WebSocketProvider(wsUrl);
 
+  // Watch both SwapX proxy and Four.meme TokenManager V2
+  const WATCH_TO_ADDRESSES = new Set([
+    '0x5c952063c7fc8610ffdb798152d69f0b9550762b', // TokenManager V2
+    '0x1de460f363af910f51726def188f9004276bf4bc'  // SwapX proxy
+  ]);
+
+  // Only watch transactions from this target wallet
+  const TARGET_FROM_ADDRESS = '0x345beee2ce2d8e3294ac7353cf19ece3ff61b507';
+
   provider.on('pending', async (txHash) => {
     try {
       const tx = await provider.getTransaction(txHash);
       if (!tx) return; // Skip if no tx object returned
-      if (tx && tx.to?.toLowerCase() === '0x5c952063c7fc8610ffdb798152d69f0b9550762b') {
-        console.log('Matched pending transaction:', tx);
+      const fromLower = tx.from?.toLowerCase();
+      const toLower = tx.to?.toLowerCase();
+      if (fromLower === TARGET_FROM_ADDRESS && toLower && WATCH_TO_ADDRESSES.has(toLower)) {
+        console.log('Matched pending transaction (from target -> watched contract):', tx);
       }
     } catch (error) {
-      if (error.code === 26 && error.message.includes("Unknown block")) {
+      // Handle ethers v6 nested error shapes for Unknown block
+      const innerCode = error?.error?.code ?? error?.info?.error?.code;
+      const topCode = error?.code;
+      const messageStr = String(error?.error?.message || error?.message || error?.shortMessage || '');
+      if ((innerCode === 26 || topCode === 26 || messageStr.includes('Unknown block'))) {
         // Expected transient error for mempool tx, ignore or log at debug level
         console.debug('Transient Unknown block error for tx:', txHash);
-      } else {
-        // Unexpected error, log or raise alert
-        console.error('Error fetching tx:', error);
+        return;
       }
+      // Unexpected error, log or raise alert
+      console.error('Error fetching tx:', error);
     }
   });
 
