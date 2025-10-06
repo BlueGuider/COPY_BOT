@@ -68,7 +68,10 @@ export const config = {
     gasLimitBuffer: parseInt(process.env.GAS_LIMIT_BUFFER || '20'), // percentage
     maxSlippage: parseFloat(process.env.MAX_SLIPPAGE || '5'), // percentage
     enableMEVProtection: process.env.ENABLE_MEV_PROTECTION !== 'false',
-    bundleTimeout: parseInt(process.env.BUNDLE_TIMEOUT || '30000') // milliseconds
+    bundleTimeout: parseInt(process.env.BUNDLE_TIMEOUT || '30000'), // milliseconds
+    gasPriceMode: (process.env.GAS_PRICE_MODE as any) || 'network', // 'network' | 'fixed'
+    fixedGasPrice: process.env.FIXED_GAS_PRICE || undefined,
+    gasBumpPercent: process.env.GAS_BUMP_PERCENT ? parseFloat(process.env.GAS_BUMP_PERCENT) : undefined
   } as TradingConfig,
 
   // Auto Trading Configuration

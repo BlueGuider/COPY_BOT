@@ -113,25 +113,26 @@ export const retryWithBackoff = async <T>(
  */
 export const getCurrentGasPrice = async (): Promise<bigint> => {
   return retryWithBackoff(async () => {
-    const gasPrice = await publicClient.getGasPrice();
-    const gasPriceGwei = Number(gasPrice) / 1e9;
-    
-    console.log(`Current network gas price: ${gasPriceGwei} gwei`);
-    
-    // Apply safety multipliers
+    const mode = config.trading.gasPriceMode || 'network';
     const minGasPrice = parseFloat(config.trading.minGasPrice);
     const maxGasPrice = parseFloat(config.trading.maxGasPrice);
     const multiplier = config.trading.gasPriceMultiplier;
-    
+
+    if (mode === 'fixed' && config.trading.fixedGasPrice) {
+      const fixed = Math.max(Math.min(parseFloat(config.trading.fixedGasPrice), maxGasPrice), minGasPrice);
+      console.log(`Using fixed gas price from env: ${fixed} gwei`);
+      return BigInt(Math.floor(fixed * 1e9));
+    }
+
+    const gasPrice = await publicClient.getGasPrice();
+    const gasPriceGwei = Number(gasPrice) / 1e9;
+    console.log(`Current network gas price: ${gasPriceGwei} gwei`);
+
     let adjustedGasPrice = gasPriceGwei * multiplier;
-    
-    // Ensure within bounds
     adjustedGasPrice = Math.max(adjustedGasPrice, minGasPrice);
     adjustedGasPrice = Math.min(adjustedGasPrice, maxGasPrice);
-    
-    // Less verbose during hot paths
     console.log(`Adjusted gas price: ${adjustedGasPrice} gwei (multiplier: ${multiplier})`);
-    
+
     return BigInt(Math.floor(adjustedGasPrice * 1e9));
   });
 };
