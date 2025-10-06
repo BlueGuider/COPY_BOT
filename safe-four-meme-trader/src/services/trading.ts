@@ -3,7 +3,7 @@ import { WalletService } from './wallet';
 import { ContractService } from './contracts';
 import { PancakeSwapService } from './pancakeSwap';
 import { ValidationUtils } from '../utils/validation';
-import { getCurrentGasPrice, publicClient, sendRawTransaction, getBalance } from '../utils/web3';
+import { getCurrentGasPrice, sendRawTransaction, getBalance } from '../utils/web3';
 import { NonceManager } from './nonceManager';
 import { 
   TOKEN_MANAGER_V1_ABI, 
