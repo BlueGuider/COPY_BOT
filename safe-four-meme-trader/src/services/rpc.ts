@@ -8,29 +8,30 @@ import { config } from '../config';
  */
 
 // Multiple BSC RPC endpoints for redundancy - OPTIMIZED BY SPEED
+// If config.BSC_RPC_URL is provided, it will be used FIRST.
 const BSC_RPC_ENDPOINTS = [
-  // FASTEST ENDPOINTS FIRST (from speed test results)
-  'https://bsc-rpc.publicnode.com',           // 21.33ms - FASTEST
-  'https://bsc.publicnode.com',               // 23.33ms - FAST
-  'https://bsc.meowrpc.com',                  // 29.67ms - FAST
-  
-  // RELIABLE BINANCE ENDPOINTS (as fallbacks)
-  'https://bsc-dataseed1.binance.org',        // 64.33ms - RELIABLE
-  'https://bsc-dataseed2.binance.org',        // 85.33ms - RELIABLE
+  // User-provided primary endpoint (set BSC_RPC_URL env)
+  ...(config.BSC_RPC_URL ? [config.BSC_RPC_URL] : []),
+
+  // FAST COMMUNITY ENDPOINTS
+  'https://bsc-mainnet.rpcfast.com?api_key=9aC7rb178eGD3tx949iD4kVSinSo5ZaptebOBkqGvt6UIUp50dlXSAlDttR6ei2E',
+  'https://bsc-rpc.publicnode.com',
+  'https://bsc.publicnode.com',
+  'https://bsc.meowrpc.com',
+
+  // RELIABLE BINANCE ENDPOINTS (fallbacks)
+  'https://bsc-dataseed1.binance.org',
+  'https://bsc-dataseed2.binance.org',
   'https://bsc-dataseed3.binance.org',
   'https://bsc-dataseed4.binance.org',
-  
+
   // OTHER FALLBACKS
-  'https://go.getblock.io/143bad395797494787f59f3647669e5d', // 43.67ms - GOOD
+  'https://go.getblock.io/143bad395797494787f59f3647669e5d',
   'https://bsc-dataseed1.defibit.io',
   'https://bsc-dataseed2.defibit.io',
   'https://bsc-dataseed1.ninicoin.io',
   'https://bsc-dataseed2.ninicoin.io',
-  'https://bsc-dataseed.binance.org',
-  
-  // LAST RESORT FALLBACKS
-  // 'https://bsc-mainnet.public.blastapi.io',   // 39.00ms - SLOWER THAN PUBLICNODE
-  // 'https://muddy-serene-fog.bsc.quiknode.pro/9cf0f2833b90790c97339c587a75e927fa0361ef', // 97.33ms - SLOWEST
+  'https://bsc-dataseed.binance.org'
 ];
 
 // Create transport with fallback
