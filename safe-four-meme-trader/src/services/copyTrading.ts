@@ -54,6 +54,20 @@ export class CopyTradingService {
   private static csvLogger: CSVLogger = CSVLogger.getInstance();
   private static mempoolProvider: any | null = null;
 
+  // Deduplication and rate-limiting state
+  private static processedTxHashes: Map<string, number> = new Map(); // txHash -> expiry timestamp
+  private static scheduledByTarget: Set<string> = new Set(); // key: userId:targetTxHash
+  private static lastCopyByToken: Map<string, number> = new Map(); // key: userId:tokenAddress -> last timestamp
+
+  // Tunables (env overrides)
+  private static readonly DEDUPE_TTL_MS = parseInt(process.env.COPY_DEDUPE_TTL_MS || '60000');
+  private static readonly TOKEN_DEBOUNCE_MS = parseInt(process.env.COPY_TOKEN_DEBOUNCE_MS || '3000');
+  private static readonly MEMPOOL_GETTX_PER_SEC = parseInt(process.env.MEMPOOL_GETTX_PER_SEC || '50');
+
+  // Simple token-bucket limiter for getTransaction calls
+  private static rlTokens = CopyTradingService.MEMPOOL_GETTX_PER_SEC;
+  private static rlLastRefill = Date.now();
+
   /**
    * Setup copy trading for a user
    */
@@ -129,6 +143,10 @@ export class CopyTradingService {
 
         this.mempoolProvider.on('pending', async (txHash: string) => {
           try {
+            // Rate-limit getTransaction lookups to avoid provider throttling
+            if (!this.tryConsumePendingToken()) {
+              return; // Drop excess events this tick
+            }
             const tx = await this.mempoolProvider.getTransaction(txHash);
             if (!tx) return;
 
@@ -155,6 +173,11 @@ export class CopyTradingService {
 
             for (const [userId, cfg] of this.configs) {
               if (cfg.enabled && cfg.targetWallet.toLowerCase() === fromAddress) {
+                // Deduplicate repeated mempool emissions for the same tx
+                if (!this.shouldProcessTx(tx.hash)) {
+                  continue;
+                }
+                this.markProcessedTx(tx.hash);
                 await this.analyzeAndCopyTransaction(userId, cfg, tx, { allowReceiptLookup: false });
               }
             }
@@ -481,6 +504,16 @@ export class CopyTradingService {
         }
       }
 
+      // Debounce repeated copy attempts on the same token within a short window
+      const debounceKey = `${userId}:${tradeInfo.tokenAddress.toLowerCase()}`;
+      const nowTs = Date.now();
+      const lastTs = this.lastCopyByToken.get(debounceKey) || 0;
+      if (nowTs - lastTs < this.TOKEN_DEBOUNCE_MS) {
+        console.log(`   ⏳ Skipping duplicate copy within ${this.TOKEN_DEBOUNCE_MS}ms for ${tradeInfo.tokenAddress.slice(0, 8)}...`);
+        return;
+      }
+      this.lastCopyByToken.set(debounceKey, nowTs);
+
       // Log successful detection with clean format
       const timestamp = new Date().toLocaleString();
       console.log(`\n🎯 [${timestamp}] TARGET TRADE DETECTED`);
@@ -516,6 +549,13 @@ export class CopyTradingService {
       setTimeout(async () => {
         console.log(`🚀 Executing scheduled copy trade for token ${copyTrade.tokenAddress.slice(0, 8)}...`);
         try {
+          // Guard against scheduling multiple executions for the same target tx per user
+          const scheduleKey = `${userId}:${copyTrade.targetTxHash}`;
+          if (this.scheduledByTarget.has(scheduleKey)) {
+            console.log(`   ⏳ Already scheduled/executed for target ${copyTrade.targetTxHash.slice(0, 10)}..., skipping`);
+            return;
+          }
+          this.scheduledByTarget.add(scheduleKey);
           await this.executeCopyTrade(userId, copyTrade);
         } catch (error) {
           console.error(`❌ Error executing copy trade:`, error);
@@ -525,6 +565,46 @@ export class CopyTradingService {
     } catch (error) {
       console.error('Error analyzing transaction:', error);
     }
+  }
+
+  // --- Deduplication + Rate-limit helpers ---
+
+  private static pruneProcessed(): void {
+    const now = Date.now();
+    for (const [hash, exp] of this.processedTxHashes.entries()) {
+      if (exp <= now) this.processedTxHashes.delete(hash);
+    }
+  }
+
+  private static shouldProcessTx(hash?: string): boolean {
+    if (!hash) return false;
+    this.pruneProcessed();
+    return !this.processedTxHashes.has(hash);
+  }
+
+  private static markProcessedTx(hash?: string): void {
+    if (!hash) return;
+    const exp = Date.now() + this.DEDUPE_TTL_MS;
+    this.processedTxHashes.set(hash, exp);
+  }
+
+  private static refillLimiter(): void {
+    const now = Date.now();
+    const elapsed = (now - this.rlLastRefill) / 1000;
+    if (elapsed > 0) {
+      const add = elapsed * this.MEMPOOL_GETTX_PER_SEC;
+      this.rlTokens = Math.min(this.MEMPOOL_GETTX_PER_SEC, this.rlTokens + add);
+      this.rlLastRefill = now;
+    }
+  }
+
+  private static tryConsumePendingToken(): boolean {
+    this.refillLimiter();
+    if (this.rlTokens >= 1) {
+      this.rlTokens -= 1;
+      return true;
+    }
+    return false;
   }
 
   /**
