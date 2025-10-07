@@ -11,6 +11,9 @@ import { bsc } from 'viem/chains';
 // Test RPC endpoints (you can modify this list)
 const RPC_ENDPOINTS = [
   // Binance official endpoints
+  'https://go.getblock.io/a89fb6981f674e87b6e67e052d8a1803',
+  'https://bsc-mainnet.rpcfast.com?api_key=9aC7rb178eGD3tx949iD4kVSinSo5ZaptebOBkqGvt6UIUp50dlXSAlDttR6ei2E',
+  'https://lb.drpc.live/bsc/AqI3Ie1juUWKoPU70_eGdMDb-J5BomIR8IEIwg8TMB_n',
   'https://bsc-dataseed1.binance.org',
   'https://bsc-dataseed2.binance.org',
   'https://bsc-dataseed3.binance.org',
@@ -295,13 +298,13 @@ class RPCSpeedTester {
       results: this.results.sort((a, b) => a.averageResponseTime - b.averageResponseTime)
     };
     
-    try {
-      const fs = await import('fs');
-      fs.writeFileSync(filename, JSON.stringify(exportData, null, 2));
-      console.log(`\n💾 Results exported to: ${filename}`);
-    } catch (error) {
-      console.log(`\n❌ Failed to export results: ${error.message}`);
-    }
+    // try {
+    //   const fs = await import('fs');
+    //   fs.writeFileSync(filename, JSON.stringify(exportData, null, 2));
+    //   console.log(`\n💾 Results exported to: ${filename}`);
+    // } catch (error) {
+    //   console.log(`\n❌ Failed to export results: ${error.message}`);
+    // }
   }
 }
 

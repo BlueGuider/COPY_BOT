@@ -11,9 +11,8 @@ import { TelegramBotService } from './telegramBot';
 import { PriceTrackingService } from './priceTrackingService';
 import { DirectPriceService } from './directPriceService';
 import { CSVLogger } from './csvLogger';
-import { config, CONTRACT_ADDRESSES } from '../config';
+import { config } from '../config';
 import { ethers } from 'ethers';
-import { performance } from 'node:perf_hooks';
 
 export interface CopyTradingConfig {
   targetWallet: string;
@@ -54,6 +53,21 @@ export class CopyTradingService {
   private static priceTrackingService: PriceTrackingService = PriceTrackingService.getInstance();
   private static csvLogger: CSVLogger = CSVLogger.getInstance();
   private static mempoolProvider: any | null = null;
+
+  // Deduplication and rate-limiting state
+  private static processedTxHashes: Map<string, number> = new Map(); // txHash -> expiry timestamp
+  private static scheduledByTarget: Set<string> = new Set(); // key: userId:targetTxHash
+  private static lastCopyByToken: Map<string, number> = new Map(); // key: userId:tokenAddress -> last timestamp
+
+  // Tunables (env overrides)
+  private static readonly DEDUPE_TTL_MS = parseInt(process.env.COPY_DEDUPE_TTL_MS || '60000');
+  private static readonly TOKEN_DEBOUNCE_MS = parseInt(process.env.COPY_TOKEN_DEBOUNCE_MS || '3000');
+  private static readonly MEMPOOL_GETTX_PER_SEC = parseInt(process.env.MEMPOOL_GETTX_PER_SEC || '50');
+  private static readonly MEMPOOL_ALLOW_TOKEN_CONTRACT_CHECK = process.env.MEMPOOL_ALLOW_TOKEN_CONTRACT_CHECK === 'true';
+
+  // Simple token-bucket limiter for getTransaction calls
+  private static rlTokens = CopyTradingService.MEMPOOL_GETTX_PER_SEC;
+  private static rlLastRefill = Date.now();
 
   /**
    * Setup copy trading for a user
@@ -130,9 +144,11 @@ export class CopyTradingService {
 
         this.mempoolProvider.on('pending', async (txHash: string) => {
           try {
-            const tStart = performance.now();
+            // Rate-limit getTransaction lookups to avoid provider throttling
+            if (!this.tryConsumePendingToken()) {
+              return; // Drop excess events this tick
+            }
             const tx = await this.mempoolProvider.getTransaction(txHash);
-            const tGotTx = performance.now();
             if (!tx) return;
 
             const fromAddress = tx.from?.toLowerCase();
@@ -144,10 +160,12 @@ export class CopyTradingService {
             const toAddress = tx.to?.toLowerCase();
             if (!toAddress) return;
 
-            // Quick pre-filter: only proceed if to is known trading contract or token contract
+            // Quick pre-filter
+            // In mempool mode, avoid expensive token checks unless explicitly enabled.
+            // Only pass through known trading contracts by default.
             const isKnown = await this.isKnownTradingContract(toAddress);
             let proceed = isKnown;
-            if (!proceed) {
+            if (!proceed && this.MEMPOOL_ALLOW_TOKEN_CONTRACT_CHECK) {
               try {
                 proceed = await this.isTokenContract(toAddress);
               } catch (_) {
@@ -156,26 +174,16 @@ export class CopyTradingService {
             }
             if (!proceed) return;
 
-            // Skip non-trading ERC20 ops in mempool (e.g., approve/increaseAllowance/permit)
-            const inputData = (tx as any).input ?? (tx as any).data ?? '';
-            const selector = typeof inputData === 'string' ? inputData.slice(0, 10).toLowerCase() : '';
-            const skipSelectors = new Set([
-              '0x095ea7b3', // approve(address,uint256)
-              '0x39509351', // increaseAllowance(address,uint256)
-              '0xd505accf'  // permit(...)
-            ]);
-            if (skipSelectors.has(selector)) {
-              console.log(`   🔍 Skipping non-trade ERC20 method (${selector}) in mempool`);
-              return;
-            }
-
             for (const [userId, cfg] of this.configs) {
               if (cfg.enabled && cfg.targetWallet.toLowerCase() === fromAddress) {
+                // Deduplicate repeated mempool emissions for the same tx
+                if (!this.shouldProcessTx(tx.hash)) {
+                  continue;
+                }
+                this.markProcessedTx(tx.hash);
                 await this.analyzeAndCopyTransaction(userId, cfg, tx, { allowReceiptLookup: false });
               }
             }
-
-            console.log(`⏱ [mempool] getTx: ${Math.round(tGotTx - tStart)}ms, total pending handler: ${Math.round(performance.now() - tStart)}ms`);
 
           } catch (error: any) {
             const innerCode = error?.error?.code ?? error?.info?.error?.code;
@@ -366,6 +374,12 @@ export class CopyTradingService {
       const fromAddress = tx.from?.toLowerCase();
       if (!fromAddress) return;
 
+      // Global dedupe for both block and mempool paths
+      if (!this.shouldProcessTx(tx.hash)) {
+        return;
+      }
+      this.markProcessedTx(tx.hash);
+
       // Check if this transaction is from any target wallet
       for (const [userId, config] of this.configs) {
         if (config.targetWallet.toLowerCase() === fromAddress && config.enabled) {
@@ -382,11 +396,12 @@ export class CopyTradingService {
    */
   private static async analyzeAndCopyTransaction(
     userId: string,
-    config: CopyTradingConfig,
+    copyCfg: CopyTradingConfig,
     tx: any,
     opts?: { allowReceiptLookup?: boolean }
   ): Promise<void> {
     try {
+      const modeLabel = (config.monitoring?.mode === 'mempool') ? '[mempool]' : '[block]';
       const allowReceiptLookup = opts?.allowReceiptLookup ?? true;
       const toAddress = tx.to?.toLowerCase();
       if (!toAddress) {
@@ -405,17 +420,18 @@ export class CopyTradingService {
 
       // Parse transaction data to determine if it's a buy or sell
       console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Parsing transaction data...`);
-      const inputPreview = (tx as any).input ?? (tx as any).data ?? '';
-      console.log(`   📊 Transaction details: from=${tx.from}, to=${tx.to}, value=${tx.value}, input=${String(inputPreview).slice(0, 10)}...`);
+      const shownInput = (tx as any).input ?? (tx as any).data;
+      console.log(`   📊 Transaction details: from=${tx.from}, to=${tx.to}, value=${tx.value}, input=${shownInput ? String(shownInput).slice(0, 10) : 'undefined'}...`);
       
-      const tParseStart = performance.now();
+      const tParseStart = Date.now();
       let tradeInfo = await this.parseTransactionData(tx, { allowReceiptLookup });
-      const tParseEnd = performance.now();
-      console.log(`   ⏱ [mempool] parse: ${Math.round(tParseEnd - tParseStart)}ms (pending=${!allowReceiptLookup})`);
+      console.log(`   ⏱ ${modeLabel} parse: ${Date.now() - tParseStart}ms (pending=${!allowReceiptLookup})`);
       if (!tradeInfo) {
         if (allowReceiptLookup) {
           console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Could not parse trade data, trying internal transaction analysis`);
+          const tInternalStart = Date.now();
           tradeInfo = await this.analyzeInternalTransactions(tx);
+          console.log(`   ⏱ ${modeLabel} internal: ${Date.now() - tInternalStart}ms`);
           if (!tradeInfo) {
             console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Could not determine trade type from internal transactions`);
             return;
@@ -432,7 +448,7 @@ export class CopyTradingService {
 
       // Check if token is allowed/blocked
       console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Checking if token is allowed...`);
-      if (!this.isTokenAllowed(config, tradeInfo.tokenAddress)) {
+      if (!this.isTokenAllowed(copyCfg, tradeInfo.tokenAddress)) {
         console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Token not allowed`);
         return;
       }
@@ -440,9 +456,9 @@ export class CopyTradingService {
 
       // Determine trading platform and validate accordingly
       console.log(`   🔍 Transaction ${tx.hash?.slice(0, 10)}...: Determining trading platform for token ${tradeInfo.tokenAddress}...`);
-      const tPlatStart = performance.now();
+      const tPlatStart = Date.now();
       const platformInfo = await this.determineTradingPlatform(tradeInfo.tokenAddress);
-      console.log(`   ⏱ [mempool] platform: ${Math.round(performance.now() - tPlatStart)}ms`);
+      console.log(`   ⏱ ${modeLabel} platform: ${Date.now() - tPlatStart}ms`);
       console.log(`   📊 Transaction ${tx.hash?.slice(0, 10)}...: Platform: ${platformInfo.platform}, Tradeable: ${platformInfo.isTradeable}`);
       
       if (!platformInfo.isTradeable) {
@@ -478,32 +494,46 @@ export class CopyTradingService {
         if (profitInfo.profitPercent >= 5) {
           // Good profit (5%+), sell immediately
           console.log(`   ✅ Good profit (${profitInfo.profitPercent.toFixed(2)}%), selling immediately`);
-          copyAmount = Math.min(config.maxPositionSize, 0.001);
+          copyAmount = Math.min(copyCfg.maxPositionSize, 0.001);
+        } else if (profitInfo.profitPercent <= 0 && profitInfo.profitPercent >= -5) {
+          // Small loss (<=5%) or breakeven: exit immediately, do not hold
+          console.log(`   ⚖️ Small loss/breakeven (${profitInfo.profitPercent.toFixed(2)}%), selling immediately`);
+          copyAmount = Math.min(copyCfg.maxPositionSize, 0.001);
         } else {
           // Low profit (<5%), hold for 2 minutes and monitor
           console.log(`   ⏳ Low profit (${profitInfo.profitPercent.toFixed(2)}%), holding for 2 minutes...`);
-          await this.scheduleSmartSell(tradeInfo.tokenAddress, userId, config, profitInfo);
+          await this.scheduleSmartSell(tradeInfo.tokenAddress, userId, copyCfg, profitInfo);
           return; // Don't execute immediate sell
         }
         
-        if (copyAmount < config.minPositionSize) {
-          console.log(`   ❌ SELL copy amount too small (${copyAmount.toFixed(6)} < ${config.minPositionSize}), skipping trade`);
+        if (copyAmount < copyCfg.minPositionSize) {
+          console.log(`   ❌ SELL copy amount too small (${copyAmount.toFixed(6)} < ${copyCfg.minPositionSize}), skipping trade`);
           return;
         }
       } else {
         // For BUY transactions, use the original BNB amount
-        console.log(`   📊 Original BUY amount: ${tradeInfo.bnbAmount.toFixed(6)} BNB, Copy ratio: ${(config.copyRatio * 100).toFixed(1)}%`);
+        console.log(`   📊 Original BUY amount: ${tradeInfo.bnbAmount.toFixed(6)} BNB, Copy ratio: ${(copyCfg.copyRatio * 100).toFixed(1)}%`);
         copyAmount = Math.min(
-          tradeInfo.bnbAmount * config.copyRatio,
-          config.maxPositionSize
+          tradeInfo.bnbAmount * copyCfg.copyRatio,
+          copyCfg.maxPositionSize
         );
 
-        console.log(`   💰 BUY copy amount: ${copyAmount.toFixed(6)} BNB, Min position size: ${config.minPositionSize} BNB`);
-        if (copyAmount < config.minPositionSize) {
-          console.log(`   ❌ BUY copy amount too small (${copyAmount.toFixed(6)} < ${config.minPositionSize}), skipping trade`);
+        console.log(`   💰 BUY copy amount: ${copyAmount.toFixed(6)} BNB, Min position size: ${copyCfg.minPositionSize} BNB`);
+        if (copyAmount < copyCfg.minPositionSize) {
+          console.log(`   ❌ BUY copy amount too small (${copyAmount.toFixed(6)} < ${copyCfg.minPositionSize}), skipping trade`);
           return;
         }
       }
+
+      // Debounce repeated copy attempts on the same token within a short window
+      const debounceKey = `${userId}:${tradeInfo.tokenAddress.toLowerCase()}`;
+      const nowTs = Date.now();
+      const lastTs = this.lastCopyByToken.get(debounceKey) || 0;
+      if (nowTs - lastTs < this.TOKEN_DEBOUNCE_MS) {
+        console.log(`   ⏳ Skipping duplicate copy within ${this.TOKEN_DEBOUNCE_MS}ms for ${tradeInfo.tokenAddress.slice(0, 8)}...`);
+        return;
+      }
+      this.lastCopyByToken.set(debounceKey, nowTs);
 
       // Log successful detection with clean format
       const timestamp = new Date().toLocaleString();
@@ -513,7 +543,7 @@ export class CopyTradingService {
       console.log(`   🪙 Token: ${tradeInfo.tokenAddress.slice(0, 10)}...${tradeInfo.tokenAddress.slice(-6)}`);
       console.log(`   💰 Amount: ${tradeInfo.bnbAmount.toFixed(6)} BNB`);
       console.log(`   🏢 Platform: ${platformInfo.platform}`);
-      console.log(`   📊 Copy: ${copyAmount.toFixed(6)} BNB (${(config.copyRatio * 100).toFixed(1)}%)`);
+      console.log(`   📊 Copy: ${copyAmount.toFixed(6)} BNB (${(copyCfg.copyRatio * 100).toFixed(1)}%)`);
       if (tradeInfo.tokenAmount) {
         console.log(`   🪙 Tokens: ${tradeInfo.tokenAmount.toFixed(2)}`);
       }
@@ -526,7 +556,7 @@ export class CopyTradingService {
         tradeType: tradeInfo.type,
         targetAmount: tradeInfo.bnbAmount,
         copiedAmount: copyAmount,
-        copyRatio: config.copyRatio,
+        copyRatio: copyCfg.copyRatio,
         executedAt: new Date(),
         status: 'PENDING',
         userId: userId,
@@ -536,7 +566,18 @@ export class CopyTradingService {
       this.activeTrades.set(copyTrade.id, copyTrade);
 
       // Execute copy trade with delay
-      console.log(`⏰ Scheduling copy trade execution in ${config.delayMs}ms...`);
+      console.log(`⏰ Scheduling copy trade execution in ${copyCfg.delayMs}ms...`);
+      if (copyCfg.delayMs && copyCfg.delayMs > 0) {
+        console.log(`   ⏱ ${modeLabel} delay: ${copyCfg.delayMs}ms`);
+      }
+      // Guard against scheduling multiple executions for the same target tx per user
+      const scheduleKey = `${userId}:${copyTrade.targetTxHash}`;
+      if (this.scheduledByTarget.has(scheduleKey)) {
+        console.log(`   ⏳ Already scheduled/executed for target ${copyTrade.targetTxHash.slice(0, 10)}..., skipping`);
+        return;
+      }
+      this.scheduledByTarget.add(scheduleKey);
+
       setTimeout(async () => {
         console.log(`🚀 Executing scheduled copy trade for token ${copyTrade.tokenAddress.slice(0, 8)}...`);
         try {
@@ -544,11 +585,51 @@ export class CopyTradingService {
         } catch (error) {
           console.error(`❌ Error executing copy trade:`, error);
         }
-      }, config.delayMs);
+      }, copyCfg.delayMs);
 
     } catch (error) {
       console.error('Error analyzing transaction:', error);
     }
+  }
+
+  // --- Deduplication + Rate-limit helpers ---
+
+  private static pruneProcessed(): void {
+    const now = Date.now();
+    for (const [hash, exp] of this.processedTxHashes.entries()) {
+      if (exp <= now) this.processedTxHashes.delete(hash);
+    }
+  }
+
+  private static shouldProcessTx(hash?: string): boolean {
+    if (!hash) return false;
+    this.pruneProcessed();
+    return !this.processedTxHashes.has(hash);
+  }
+
+  private static markProcessedTx(hash?: string): void {
+    if (!hash) return;
+    const exp = Date.now() + this.DEDUPE_TTL_MS;
+    this.processedTxHashes.set(hash, exp);
+  }
+
+  private static refillLimiter(): void {
+    const now = Date.now();
+    const elapsed = (now - this.rlLastRefill) / 1000;
+    if (elapsed > 0) {
+      const add = elapsed * this.MEMPOOL_GETTX_PER_SEC;
+      this.rlTokens = Math.min(this.MEMPOOL_GETTX_PER_SEC, this.rlTokens + add);
+      this.rlLastRefill = now;
+    }
+  }
+
+  private static tryConsumePendingToken(): boolean {
+    this.refillLimiter();
+    if (this.rlTokens >= 1) {
+      this.rlTokens -= 1;
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -563,7 +644,9 @@ export class CopyTradingService {
       // SwapX contract (proxy) - Main contract for trading
       '0x1de460f363af910f51726def188f9004276bf4bc',
       // SwapX implementation
-      '0x7c7ae3868d969b57b7a47fd5cba8899df1f3d564'
+      '0x7c7ae3868d969b57b7a47fd5cba8899df1f3d564',
+      // Dragun router (bot service)
+      '0xca980f000771f70b15647069e9e541ef73f71f2f'
     ];
 
     const lowerAddress = address.toLowerCase();
@@ -608,12 +691,6 @@ export class CopyTradingService {
     try {
       const bnbAmount = Number(tx.value) / 1e18;
       const inputData = (tx as any).input ?? (tx as any).data;
-      const wbnb = CONTRACT_ADDRESSES.WBNB.toLowerCase();
-      const isBNBorWBNB = (addr?: string) => {
-        if (!addr) return false;
-        const a = addr.toLowerCase();
-        return a === '0x0000000000000000000000000000000000000000' || a === wbnb;
-      };
       
       // Validate transaction data
       if (!tx.to || !tx.from) {
@@ -711,10 +788,11 @@ export class CopyTradingService {
           const [tokenIn, tokenOut, amountIn, _amountOutMin, _poolAddress] = decoded.args as [string, string, bigint, bigint, string];
           
           // Determine if it's a buy or sell based on token addresses
-          const isNativeIn = isBNBorWBNB(tokenIn);
-          const isNativeOut = isBNBorWBNB(tokenOut);
+          // If tokenIn is BNB (0x0000...0000) and tokenOut is a token, it's a BUY
+          // If tokenIn is a token and tokenOut is BNB, it's a SELL
+          const isBNB = tokenIn === '0x0000000000000000000000000000000000000000';
           
-          if (isNativeIn && !isNativeOut) {
+          if (isBNB) {
             // BUY: BNB -> Token - need to get actual token amount from logs
             const tokenAmount = await this.getTokenAmountFromLogs(tx, tokenOut.toLowerCase());
             return {
@@ -723,20 +801,12 @@ export class CopyTradingService {
               bnbAmount,
               tokenAmount: tokenAmount || Number(amountIn) / 1e18 // Fallback to amountIn if logs fail
             };
-          } else if (!isNativeIn && isNativeOut) {
+          } else {
             // SELL: Token -> BNB
             return {
               type: 'SELL',
               tokenAddress: tokenIn.toLowerCase(),
               bnbAmount: 0, // Sell transactions don't send BNB
-              tokenAmount: Number(amountIn) / 1e18
-            };
-          } else {
-            // Token to token swap
-            return {
-              type: 'SELL',
-              tokenAddress: tokenIn.toLowerCase(),
-              bnbAmount: 0,
               tokenAmount: Number(amountIn) / 1e18
             };
           }
@@ -748,10 +818,9 @@ export class CopyTradingService {
           console.log(`   🔍 swapV3ExactIn: ${tokenIn} -> ${tokenOut}, amount: ${amountIn}`);
           
           // Determine if it's a buy or sell based on token addresses
-          const isNativeIn = isBNBorWBNB(tokenIn);
-          const isNativeOut = isBNBorWBNB(tokenOut);
+          const isBNB = tokenIn === '0x0000000000000000000000000000000000000000';
           
-          if (isNativeIn && !isNativeOut) {
+          if (isBNB) {
             // BUY: BNB -> Token - need to get actual token amount from logs
             const tokenAmount = await this.getTokenAmountFromLogs(tx, tokenOut.toLowerCase());
             return {
@@ -760,16 +829,8 @@ export class CopyTradingService {
               bnbAmount,
               tokenAmount: tokenAmount || Number(amountIn) / 1e18 // Fallback to amountIn if logs fail
             };
-          } else if (!isNativeIn && isNativeOut) {
-            // SELL: Token -> BNB
-            return {
-              type: 'SELL',
-              tokenAddress: tokenIn.toLowerCase(),
-              bnbAmount: 0,
-              tokenAmount: Number(amountIn) / 1e18
-            };
           } else {
-            // Token to token swap
+            // SELL: Token -> BNB
             return {
               type: 'SELL',
               tokenAddress: tokenIn.toLowerCase(),
@@ -789,8 +850,8 @@ export class CopyTradingService {
           const firstToken = path[0];
           const lastToken = path[path.length - 1];
           
-          const isBNBIn = isBNBorWBNB(firstToken);
-          const isBNBOut = isBNBorWBNB(lastToken);
+          const isBNBIn = firstToken === '0x0000000000000000000000000000000000000000';
+          const isBNBOut = lastToken === '0x0000000000000000000000000000000000000000';
           
           if (isBNBIn && !isBNBOut) {
             // BUY: BNB -> Token - need to get actual token amount from logs
@@ -827,7 +888,7 @@ export class CopyTradingService {
           
           console.log(`   🔍 swapV2MultiHopExactIn: ${tokenIn} -> ${path[path.length - 1]}, amount: ${amountIn}`);
           
-          const isBNB = isBNBorWBNB(tokenIn);
+          const isBNB = tokenIn === '0x0000000000000000000000000000000000000000';
           const lastToken = path[path.length - 1];
           
           if (isBNB) {
@@ -861,8 +922,8 @@ export class CopyTradingService {
             const firstToken = path[0];
             const lastToken = path[path.length - 1];
             
-          const isBNBIn = isBNBorWBNB(firstToken);
-          const isBNBOut = isBNBorWBNB(lastToken);
+            const isBNBIn = firstToken === '0x0000000000000000000000000000000000000000';
+            const isBNBOut = lastToken === '0x0000000000000000000000000000000000000000';
             
             if (isBNBIn && !isBNBOut) {
               // BUY: BNB -> Token - need to get actual token amount from logs
@@ -982,8 +1043,8 @@ export class CopyTradingService {
             console.log(`   📝 Last swap: ${lastSwap.tokenIn} -> ${lastSwap.tokenOut}`);
             
             // Determine if it's a buy or sell based on the swap path
-            const isBNBIn = isBNBorWBNB(firstSwap.tokenIn);
-            const isBNBOut = isBNBorWBNB(lastSwap.tokenOut);
+            const isBNBIn = firstSwap.tokenIn === '0x0000000000000000000000000000000000000000';
+            const isBNBOut = lastSwap.tokenOut === '0x0000000000000000000000000000000000000000';
             
             if (isBNBIn && !isBNBOut) {
               // BUY: BNB -> Token - need to get actual token amount from logs
@@ -1022,33 +1083,19 @@ export class CopyTradingService {
           };
         } else {
           console.log(`   ⚠️  Unknown SwapX function: ${decoded.functionName}`);
-          const allowReceiptLookup = opts?.allowReceiptLookup ?? true;
-          if (allowReceiptLookup) {
-            // Try to analyze using internal transactions for unknown functions
-            return await this.analyzeInternalTransactions(tx);
-          }
-          return null;
-        }
-      } catch (swapXError) {
-        // Not a SwapX function either - optionally try internal transaction analysis
-        console.log(`   ⚠️  SwapX function decoding failed: ${(swapXError as Error).message}`);
-        const allowReceiptLookup = opts?.allowReceiptLookup ?? true;
-        if (allowReceiptLookup) {
-          console.log(`   🔍 Trying internal transaction analysis...`);
+          // Try to analyze using internal transactions for unknown functions
           return await this.analyzeInternalTransactions(tx);
         }
-        return null;
+      } catch (swapXError) {
+        // Not a SwapX function either - try internal transaction analysis
+        console.log(`   ⚠️  SwapX function decoding failed: ${(swapXError as Error).message}`);
+        console.log(`   🔍 Trying internal transaction analysis...`);
+        return await this.analyzeInternalTransactions(tx);
       }
 
       // If we get here, it's not a recognized trading function
-      // Try to analyze using internal transactions and token transfers (only if receipt lookup allowed)
-      {
-        const allowReceiptLookup = opts?.allowReceiptLookup ?? true;
-        if (allowReceiptLookup) {
-          return await this.analyzeInternalTransactions(tx);
-        }
-        return null;
-      }
+      // Try to analyze using internal transactions and token transfers
+      return await this.analyzeInternalTransactions(tx);
     } catch (error) {
       console.error('Error parsing transaction data:', error);
       return null;
@@ -1836,36 +1883,85 @@ export class CopyTradingService {
     _config: CopyTradingConfig,
     _initialProfitInfo: { profitPercent: number; buyPrice: number; currentPrice: number }
   ): Promise<void> {
-    console.log(`   ⏰ Scheduling smart sell for ${tokenAddress.slice(0, 8)}... (2-minute hold period)`);
-    
-    const holdPeriodMs = 2 * 60 * 1000; // 2 minutes
-    const checkIntervalMs = 1 * 1000; // Check every 10 seconds
-    
-    let timeElapsed = 0;
-    
+    console.log(`   ⏰ Scheduling smart sell for ${tokenAddress.slice(0, 8)}... with enhanced rules`);
+
+    const HOLD_MS = 2 * 60 * 1000; // base hold window
+    const CHECK_MS = 1 * 1000; // 1s checks
+    const STAGNATION_MS = parseInt(process.env.SMART_SELL_STAGNATION_MS || '60000'); // sell if no change ≥60s
+    const DRAWDOWN_FROM_BUY_PCT = parseFloat(process.env.SMART_SELL_BUY_DRAWDOWN_PCT || '30'); // sell if drop ≥30% from buy
+    const TRAILING_STOP_PCT = parseFloat(process.env.SMART_SELL_TRAILING_STOP_PCT || '5'); // sell if fall ≥5% from peak
+
+    let startTs = Date.now();
+    let lastChangeTs = Date.now();
+    let peakPrice = _initialProfitInfo.currentPrice || 0;
+    let lastPrice = _initialProfitInfo.currentPrice || 0;
+    const buyPrice = _initialProfitInfo.buyPrice || 0;
+    let extendedForTrailing = false; // extend beyond HOLD_MS if rising and profitable
+
     const checkInterval = setInterval(async () => {
-      timeElapsed += checkIntervalMs;
-      
       try {
-        // Check current profit
-        const currentProfitInfo = await this.checkTokenProfit(tokenAddress, userId);
-        console.log(`   📈 [${Math.floor(timeElapsed/1000)}s] Current profit: ${currentProfitInfo.profitPercent.toFixed(2)}%`);
-        
-        if (currentProfitInfo.profitPercent >= 5) {
-          // Good profit reached, sell now
-          console.log(`   ✅ Profit reached ${currentProfitInfo.profitPercent.toFixed(2)}%, selling now!`);
-          clearInterval(checkInterval);
-          await this.executeSmartSell(tokenAddress, userId, _config);
-        } else if (timeElapsed >= holdPeriodMs) {
-          // 2 minutes elapsed, sell anyway
-          console.log(`   ⏰ 2 minutes elapsed, selling at ${currentProfitInfo.profitPercent.toFixed(2)}% profit`);
-          clearInterval(checkInterval);
-          await this.executeSmartSell(tokenAddress, userId, _config);
+        const now = Date.now();
+        const { profitPercent, buyPrice: bp, currentPrice } = await this.checkTokenProfit(tokenAddress, userId);
+
+        const buyRef = buyPrice > 0 ? buyPrice : (bp || 0);
+        const price = currentPrice || 0;
+
+        // Track changes and peak
+        if (price !== lastPrice) {
+          lastChangeTs = now;
+          lastPrice = price;
         }
+        if (price > peakPrice) {
+          peakPrice = price;
+        }
+
+        // 1) Stagnation: no change for ≥ STAGNATION_MS
+        if (now - lastChangeTs >= STAGNATION_MS) {
+          console.log(`   ⏱ No price change for ${Math.floor((now - lastChangeTs)/1000)}s (≥${Math.floor(STAGNATION_MS/1000)}s) -> SELL`);
+          clearInterval(checkInterval);
+          await this.executeSmartSell(tokenAddress, userId, _config);
+          return;
+        }
+
+        // 2) Hard drawdown from buy: ≥ DRAWDOWN_FROM_BUY_PCT%
+        if (buyRef > 0 && price <= buyRef * (1 - DRAWDOWN_FROM_BUY_PCT / 100)) {
+          console.log(`   ⛔ Price dropped ≥${DRAWDOWN_FROM_BUY_PCT}% from buy -> SELL`);
+          clearInterval(checkInterval);
+          await this.executeSmartSell(tokenAddress, userId, _config);
+          return;
+        }
+
+        // 3) Trailing stop if profitable: sell when price falls ≥ TRAILING_STOP_PCT% from peak
+        if (buyRef > 0 && price > buyRef && peakPrice > 0) {
+          // Extend hold beyond HOLD_MS while profitable and not violating trailing stop
+          if (!extendedForTrailing && now - startTs >= HOLD_MS) {
+            console.log(`   ⏰ Base hold elapsed, but profitable and rising -> extend with trailing stop`);
+            extendedForTrailing = true;
+          }
+
+          const trailTrigger = peakPrice * (1 - TRAILING_STOP_PCT / 100);
+          if (price <= trailTrigger) {
+            console.log(`   📉 Fell ≥${TRAILING_STOP_PCT}% from peak (peak=${peakPrice.toFixed(10)}, now=${price.toFixed(10)}) -> SELL`);
+            clearInterval(checkInterval);
+            await this.executeSmartSell(tokenAddress, userId, _config);
+            return;
+          }
+        }
+
+        // 4) Base hold expiration: if not extended by trailing stop and no other triggers, sell at end of hold
+        if (!extendedForTrailing && now - startTs >= HOLD_MS) {
+          console.log(`   ⏰ Hold window elapsed (${Math.floor(HOLD_MS/1000)}s) -> SELL`);
+          clearInterval(checkInterval);
+          await this.executeSmartSell(tokenAddress, userId, _config);
+          return;
+        }
+
+        // Progress log
+        console.log(`   📈 [${Math.floor((now - startTs)/1000)}s] price=${price.toFixed(10)}, buy=${buyRef.toFixed(10)}, peak=${peakPrice.toFixed(10)}, profit=${profitPercent.toFixed(2)}%`);
       } catch (error) {
         console.error('Error in smart sell monitoring:', error);
       }
-    }, checkIntervalMs);
+    }, CHECK_MS);
   }
 
   /**

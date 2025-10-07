@@ -1,7 +1,7 @@
 const { ethers } = require('ethers');
 
 async function main() {
-  const wsUrl = 'wss://bsc-mainnet.rpcfast.com/ws?api_key=9aC7rb178eGD3tx949iD4kVSinSo5ZaptebOBkqGvt6UIUp50dlXSAlDttR6ei2E';
+  const wsUrl = 'wss://lb.drpc.live/bsc/AqI3Ie1juUWKoPU70_eGdMDb-J5BomIR8IEIwg8TMB_n';
   const provider = new ethers.WebSocketProvider(wsUrl);
 
   // Watch both SwapX proxy and Four.meme TokenManager V2
@@ -11,7 +11,7 @@ async function main() {
   ]);
 
   // Only watch transactions from this target wallet
-  const TARGET_FROM_ADDRESS = '0x345beee2ce2d8e3294ac7353cf19ece3ff61b507';
+  const TARGET_FROM_ADDRESS = '0x56d5f3491c100b00b9823fa427d8b92cd6a6fcae';
 
   provider.on('pending', async (txHash) => {
     try {
@@ -29,7 +29,7 @@ async function main() {
       const messageStr = String(error?.error?.message || error?.message || error?.shortMessage || '');
       if ((innerCode === 26 || topCode === 26 || messageStr.includes('Unknown block'))) {
         // Expected transient error for mempool tx, ignore or log at debug level
-        console.debug('Transient Unknown block error for tx:', txHash);
+        // console.debug('Transient Unknown block error for tx:', txHash);
         return;
       }
       // Unexpected error, log or raise alert

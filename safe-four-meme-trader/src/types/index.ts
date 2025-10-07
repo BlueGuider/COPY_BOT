@@ -101,6 +101,10 @@ export interface TradingConfig {
   maxSlippage: number;
   enableMEVProtection: boolean;
   bundleTimeout: number;
+  // Optional gas price strategy controls
+  gasPriceMode?: 'network' | 'fixed';
+  fixedGasPrice?: string; // gwei
+  gasBumpPercent?: number; // for replacement strategy (future use)
 }
 
 export interface ValidationError {
