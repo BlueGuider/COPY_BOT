@@ -1879,36 +1879,85 @@ export class CopyTradingService {
     _config: CopyTradingConfig,
     _initialProfitInfo: { profitPercent: number; buyPrice: number; currentPrice: number }
   ): Promise<void> {
-    console.log(`   ⏰ Scheduling smart sell for ${tokenAddress.slice(0, 8)}... (2-minute hold period)`);
-    
-    const holdPeriodMs = 2 * 60 * 1000; // 2 minutes
-    const checkIntervalMs = 1 * 1000; // Check every 10 seconds
-    
-    let timeElapsed = 0;
-    
+    console.log(`   ⏰ Scheduling smart sell for ${tokenAddress.slice(0, 8)}... with enhanced rules`);
+
+    const HOLD_MS = 2 * 60 * 1000; // base hold window
+    const CHECK_MS = 1 * 1000; // 1s checks
+    const STAGNATION_MS = parseInt(process.env.SMART_SELL_STAGNATION_MS || '60000'); // sell if no change ≥60s
+    const DRAWDOWN_FROM_BUY_PCT = parseFloat(process.env.SMART_SELL_BUY_DRAWDOWN_PCT || '30'); // sell if drop ≥30% from buy
+    const TRAILING_STOP_PCT = parseFloat(process.env.SMART_SELL_TRAILING_STOP_PCT || '5'); // sell if fall ≥5% from peak
+
+    let startTs = Date.now();
+    let lastChangeTs = Date.now();
+    let peakPrice = _initialProfitInfo.currentPrice || 0;
+    let lastPrice = _initialProfitInfo.currentPrice || 0;
+    const buyPrice = _initialProfitInfo.buyPrice || 0;
+    let extendedForTrailing = false; // extend beyond HOLD_MS if rising and profitable
+
     const checkInterval = setInterval(async () => {
-      timeElapsed += checkIntervalMs;
-      
       try {
-        // Check current profit
-        const currentProfitInfo = await this.checkTokenProfit(tokenAddress, userId);
-        console.log(`   📈 [${Math.floor(timeElapsed/1000)}s] Current profit: ${currentProfitInfo.profitPercent.toFixed(2)}%`);
-        
-        if (currentProfitInfo.profitPercent >= 5) {
-          // Good profit reached, sell now
-          console.log(`   ✅ Profit reached ${currentProfitInfo.profitPercent.toFixed(2)}%, selling now!`);
-          clearInterval(checkInterval);
-          await this.executeSmartSell(tokenAddress, userId, _config);
-        } else if (timeElapsed >= holdPeriodMs) {
-          // 2 minutes elapsed, sell anyway
-          console.log(`   ⏰ 2 minutes elapsed, selling at ${currentProfitInfo.profitPercent.toFixed(2)}% profit`);
-          clearInterval(checkInterval);
-          await this.executeSmartSell(tokenAddress, userId, _config);
+        const now = Date.now();
+        const { profitPercent, buyPrice: bp, currentPrice } = await this.checkTokenProfit(tokenAddress, userId);
+
+        const buyRef = buyPrice > 0 ? buyPrice : (bp || 0);
+        const price = currentPrice || 0;
+
+        // Track changes and peak
+        if (price !== lastPrice) {
+          lastChangeTs = now;
+          lastPrice = price;
         }
+        if (price > peakPrice) {
+          peakPrice = price;
+        }
+
+        // 1) Stagnation: no change for ≥ STAGNATION_MS
+        if (now - lastChangeTs >= STAGNATION_MS) {
+          console.log(`   ⏱ No price change for ${Math.floor((now - lastChangeTs)/1000)}s (≥${Math.floor(STAGNATION_MS/1000)}s) -> SELL`);
+          clearInterval(checkInterval);
+          await this.executeSmartSell(tokenAddress, userId, _config);
+          return;
+        }
+
+        // 2) Hard drawdown from buy: ≥ DRAWDOWN_FROM_BUY_PCT%
+        if (buyRef > 0 && price <= buyRef * (1 - DRAWDOWN_FROM_BUY_PCT / 100)) {
+          console.log(`   ⛔ Price dropped ≥${DRAWDOWN_FROM_BUY_PCT}% from buy -> SELL`);
+          clearInterval(checkInterval);
+          await this.executeSmartSell(tokenAddress, userId, _config);
+          return;
+        }
+
+        // 3) Trailing stop if profitable: sell when price falls ≥ TRAILING_STOP_PCT% from peak
+        if (buyRef > 0 && price > buyRef && peakPrice > 0) {
+          // Extend hold beyond HOLD_MS while profitable and not violating trailing stop
+          if (!extendedForTrailing && now - startTs >= HOLD_MS) {
+            console.log(`   ⏰ Base hold elapsed, but profitable and rising -> extend with trailing stop`);
+            extendedForTrailing = true;
+          }
+
+          const trailTrigger = peakPrice * (1 - TRAILING_STOP_PCT / 100);
+          if (price <= trailTrigger) {
+            console.log(`   📉 Fell ≥${TRAILING_STOP_PCT}% from peak (peak=${peakPrice.toFixed(10)}, now=${price.toFixed(10)}) -> SELL`);
+            clearInterval(checkInterval);
+            await this.executeSmartSell(tokenAddress, userId, _config);
+            return;
+          }
+        }
+
+        // 4) Base hold expiration: if not extended by trailing stop and no other triggers, sell at end of hold
+        if (!extendedForTrailing && now - startTs >= HOLD_MS) {
+          console.log(`   ⏰ Hold window elapsed (${Math.floor(HOLD_MS/1000)}s) -> SELL`);
+          clearInterval(checkInterval);
+          await this.executeSmartSell(tokenAddress, userId, _config);
+          return;
+        }
+
+        // Progress log
+        console.log(`   📈 [${Math.floor((now - startTs)/1000)}s] price=${price.toFixed(10)}, buy=${buyRef.toFixed(10)}, peak=${peakPrice.toFixed(10)}, profit=${profitPercent.toFixed(2)}%`);
       } catch (error) {
         console.error('Error in smart sell monitoring:', error);
       }
-    }, checkIntervalMs);
+    }, CHECK_MS);
   }
 
   /**
