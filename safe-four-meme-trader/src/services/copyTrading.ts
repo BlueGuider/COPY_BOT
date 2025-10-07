@@ -495,6 +495,10 @@ export class CopyTradingService {
           // Good profit (5%+), sell immediately
           console.log(`   ✅ Good profit (${profitInfo.profitPercent.toFixed(2)}%), selling immediately`);
           copyAmount = Math.min(copyCfg.maxPositionSize, 0.001);
+        } else if (profitInfo.profitPercent <= 0 && profitInfo.profitPercent >= -5) {
+          // Small loss (<=5%) or breakeven: exit immediately, do not hold
+          console.log(`   ⚖️ Small loss/breakeven (${profitInfo.profitPercent.toFixed(2)}%), selling immediately`);
+          copyAmount = Math.min(copyCfg.maxPositionSize, 0.001);
         } else {
           // Low profit (<5%), hold for 2 minutes and monitor
           console.log(`   ⏳ Low profit (${profitInfo.profitPercent.toFixed(2)}%), holding for 2 minutes...`);
