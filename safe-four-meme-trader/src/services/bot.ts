@@ -6,6 +6,7 @@ import { CopyTradingService } from './copyTrading';
 import { ValidationUtils } from '../utils/validation';
 import { SecurityUtils } from '../utils/security';
 import { config } from '../config';
+import { getRpcMetricsSnapshot } from './rpc';
 
 /**
  * Telegram bot service for user interaction
@@ -83,6 +84,31 @@ export class BotService {
    * Setup bot commands
    */
   private setupCommands(): void {
+    // RPC stats command
+    this.bot.command('rpcstats', async (ctx) => {
+      try {
+        const snap = getRpcMetricsSnapshot(60_000);
+        const topMethods = Object.entries(snap.estCusByMethod)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 5)
+          .map(([m, cu]) => `${m}: ${cu}`)
+          .join('\n');
+
+        const endpoints = Object.entries(snap.byEndpoint)
+          .map(([ep, v]) => `• ${ep}: ${v.calls} calls, ${v.estCus} est CUs`)
+          .slice(0, 3)
+          .join('\n');
+
+        const msg = `📊 RPC Usage (last 60s)
+Est. CUs: ${snap.estCusTotal} (avg ${(snap.estCusPerSecAvg).toFixed(2)}/s, curr ${snap.estCusPerSecCurrent}/s)
+Top methods:\n${topMethods || '—'}
+Endpoints:\n${endpoints || '—'}`;
+        ctx.reply(msg);
+      } catch (error) {
+        console.error('Error in /rpcstats:', error);
+        ctx.reply('❌ Failed to get RPC stats');
+      }
+    });
     // Start command
     this.bot.command('start', (ctx) => {
       const welcomeMessage = `

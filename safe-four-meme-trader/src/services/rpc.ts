@@ -7,48 +7,202 @@ import { config } from '../config';
  * RPC service with multiple provider fallbacks and retry logic
  */
 
-// Multiple BSC RPC endpoints for redundancy - OPTIMIZED BY SPEED
-const BSC_RPC_ENDPOINTS = [
-  // FASTEST ENDPOINTS FIRST (from speed test results)
-  'https://bsc-mainnet.rpcfast.com?api_key=9aC7rb178eGD3tx949iD4kVSinSo5ZaptebOBkqGvt6UIUp50dlXSAlDttR6ei2E',
-  'https://bsc-mainnet.rpcfast.com?api_key=Gs2pjm79Fc7KjNH2Ey4Js89zbRMgZTpPajhFxlIt3jkE9WTYQr5PRT38dCO5pxi1',
-  'https://bsc-rpc.publicnode.com',           // 21.33ms - FASTEST
-  'https://bsc.publicnode.com',               // 23.33ms - FAST
-  'https://bsc.meowrpc.com',                  // 29.67ms - FAST
-  
-  // RELIABLE BINANCE ENDPOINTS (as fallbacks)
-  // 'https://bsc-dataseed1.binance.org',        // 64.33ms - RELIABLE
-  // 'https://bsc-dataseed2.binance.org',        // 85.33ms - RELIABLE
-  // 'https://bsc-dataseed3.binance.org',
-  // 'https://bsc-dataseed4.binance.org',
-  
-  // OTHER FALLBACKS
-  'https://go.getblock.io/143bad395797494787f59f3647669e5d', // 43.67ms - GOOD
-  // 'https://bsc-dataseed1.defibit.io',
-  // 'https://bsc-dataseed2.defibit.io',
-  // 'https://bsc-dataseed1.ninicoin.io',
-  // 'https://bsc-dataseed2.ninicoin.io',
-  // 'https://bsc-dataseed.binance.org',
-  
-  // LAST RESORT FALLBACKS
-  // 'https://bsc-mainnet.public.blastapi.io',   // 39.00ms - SLOWER THAN PUBLICNODE
-  // 'https://muddy-serene-fog.bsc.quiknode.pro/9cf0f2833b90790c97339c587a75e927fa0361ef', // 97.33ms - SLOWEST
-];
+// Multiple BSC RPC endpoints for redundancy (public first to reduce CU burn on paid providers)
+const BSC_RPC_ENDPOINTS: string[] = (() => {
+  const fromEnv = (process.env.BSC_RPC_URLS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (fromEnv.length > 0) return fromEnv;
+
+  const defaults: string[] = [
+    // Public endpoints first
+    'https://bsc-rpc.publicnode.com',
+    'https://bsc.publicnode.com',
+    'https://bsc.meowrpc.com',
+    // Configured single URL (if provided)
+    config.BSC_RPC_URL,
+    // Other fallbacks
+    'https://go.getblock.io/143bad395797494787f59f3647669e5d',
+    // Paid endpoints LAST (avoid burning CUs unless needed)
+    'https://bsc-mainnet.rpcfast.com?api_key=9aC7rb178eGD3tx949iD4kVSinSo5ZaptebOBkqGvt6UIUp50dlXSAlDttR6ei2E',
+    'https://bsc-mainnet.rpcfast.com?api_key=Gs2pjm79Fc7KjNH2Ey4Js89zbRMgZTpPajhFxlIt3jkE9WTYQr5PRT38dCO5pxi1',
+  ].filter(Boolean);
+
+  // De-duplicate while preserving order
+  return Array.from(new Set(defaults));
+})();
+
+// --- CU instrumentation and rate limiter ---
+type RpcMethodName = string;
+
+type RpcPayload = { id?: number | string; method: RpcMethodName; params?: any[] } | Array<{ id?: number | string; method: RpcMethodName; params?: any[] }>;
+
+const DEFAULT_CU_WEIGHTS: Record<RpcMethodName, number> = {
+  // Light
+  eth_chainId: 1,
+  net_version: 1,
+  web3_clientVersion: 1,
+  eth_blockNumber: 1,
+  eth_gasPrice: 2,
+  // Medium
+  eth_getBalance: 3,
+  eth_getCode: 4,
+  eth_getTransactionByHash: 3,
+  eth_getTransactionReceipt: 8,
+  eth_getTransactionCount: 3,
+  eth_call: 6,
+  // Heavy
+  eth_getLogs: 20,
+  eth_sendRawTransaction: 15,
+  eth_getBlockByNumber: 8, // adjusted higher if includeTransactions=true
+  eth_getBlockByHash: 8,   // adjusted higher if includeTransactions=true
+};
+
+const USER_CU_WEIGHTS: Partial<Record<RpcMethodName, number>> = (() => {
+  try {
+    return process.env.RPC_CU_WEIGHTS ? JSON.parse(process.env.RPC_CU_WEIGHTS) : {};
+  } catch {
+    return {};
+  }
+})();
+
+function weightFor(method: RpcMethodName, params?: any[]): number {
+  // Include-transactions boost
+  if ((method === 'eth_getBlockByNumber' || method === 'eth_getBlockByHash') && Array.isArray(params)) {
+    const includeTxs = Boolean(params[1]);
+    const base = USER_CU_WEIGHTS[method] ?? DEFAULT_CU_WEIGHTS[method] ?? 5;
+    return includeTxs ? base * 4 : base; // heuristic multiplier
+  }
+  return USER_CU_WEIGHTS[method] ?? DEFAULT_CU_WEIGHTS[method] ?? 5;
+}
+
+const metrics = {
+  callsByMethod: new Map<RpcMethodName, number>(),
+  estCusByMethod: new Map<RpcMethodName, number>(),
+  estCusTimeline: [] as Array<{ ts: number; cus: number; endpoint: string }>,
+  byEndpoint: new Map<string, { calls: number; estCus: number }>(),
+  headerCusTotal: 0,
+  headerLastSeen: {} as Record<string, string>,
+};
+
+function recordUsage(endpointUrl: string, methodWeights: Array<{ method: RpcMethodName; weight: number }>) {
+  const now = Date.now();
+  let reqCus = 0;
+  for (const { method, weight } of methodWeights) {
+    reqCus += weight;
+    metrics.callsByMethod.set(method, (metrics.callsByMethod.get(method) || 0) + 1);
+    metrics.estCusByMethod.set(method, (metrics.estCusByMethod.get(method) || 0) + weight);
+  }
+  metrics.estCusTimeline.push({ ts: now, cus: reqCus, endpoint: endpointUrl });
+  const ep = metrics.byEndpoint.get(endpointUrl) || { calls: 0, estCus: 0 };
+  ep.calls += 1;
+  ep.estCus += reqCus;
+  metrics.byEndpoint.set(endpointUrl, ep);
+
+  // Trim old entries (> 5 minutes) to bound memory
+  const cutoff = now - 5 * 60_000;
+  if (metrics.estCusTimeline.length > 5000) {
+    metrics.estCusTimeline = metrics.estCusTimeline.filter((e) => e.ts >= cutoff);
+  }
+}
+
+function parsePayload(body: any): Array<{ method: RpcMethodName; params?: any[] }> {
+  try {
+    const s = typeof body === 'string' ? body : body?.toString?.();
+    if (!s) return [];
+    const json = JSON.parse(s) as RpcPayload;
+    if (Array.isArray(json)) {
+      return json.map((j) => ({ method: j.method, params: j.params }));
+    }
+    return json && (json as any).method ? [{ method: (json as any).method, params: (json as any).params }] : [];
+  } catch {
+    return [];
+  }
+}
+
+// Simple global CU token bucket (optional; disabled unless RPC_CU_BUDGET_PER_SEC set)
+const CU_BUDGET_PER_SEC = process.env.RPC_CU_BUDGET_PER_SEC ? Math.max(1, parseInt(process.env.RPC_CU_BUDGET_PER_SEC)) : undefined;
+let cuTokens = CU_BUDGET_PER_SEC ?? 0;
+let lastRefill = Date.now();
+
+function refillTokens() {
+  if (CU_BUDGET_PER_SEC === undefined) return;
+  const now = Date.now();
+  const elapsedSec = (now - lastRefill) / 1000;
+  if (elapsedSec > 0) {
+    cuTokens = Math.min(CU_BUDGET_PER_SEC, cuTokens + elapsedSec * CU_BUDGET_PER_SEC);
+    lastRefill = now;
+  }
+}
+
+async function enforceBudget(needed: number) {
+  if (CU_BUDGET_PER_SEC === undefined) return; // limiter disabled
+  // Busy-wait with small sleeps until tokens sufficient
+  // Use coarse sleeps to avoid tight loops
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    refillTokens();
+    if (cuTokens >= needed) {
+      cuTokens -= needed;
+      return;
+    }
+    const deficit = needed - cuTokens;
+    const waitMs = Math.max(5, Math.ceil((deficit / CU_BUDGET_PER_SEC) * 1000));
+    await new Promise((r) => setTimeout(r, Math.min(waitMs, 200)));
+  }
+}
+
+function instrumentedFetchFor(endpointUrl: string) {
+  const baseFetch = (globalThis as any).fetch as typeof fetch;
+  const endpointHost = (() => {
+    try { return new URL(endpointUrl).host; } catch { return endpointUrl; }
+  })();
+
+  return async (url: any, init?: any) => {
+    // Estimate request CU before sending
+    const calls = parsePayload(init?.body);
+    const methodWeights = calls.map(({ method, params }) => ({ method, weight: weightFor(method, params) }));
+    const reqCu = methodWeights.reduce((s, c) => s + c.weight, 0);
+    await enforceBudget(reqCu);
+
+    const res = await baseFetch(url, init);
+
+    // Record header-based CUs if provider exposes them
+    try {
+      for (const [k, v] of (res.headers as any).entries?.() || []) {
+        const key = String(k).toLowerCase();
+        if (key.includes('cu') || key.includes('compute') || key.includes('ratelimit')) {
+          metrics.headerLastSeen[key] = String(v);
+          const maybeNum = Number(v);
+          if (!Number.isNaN(maybeNum) && /cu|compute/.test(key)) {
+            metrics.headerCusTotal += maybeNum;
+          }
+        }
+      }
+    } catch {}
+
+    // Record our estimate
+    recordUsage(endpointHost, methodWeights);
+    return res;
+  };
+}
 
 // Create transport with fallback
 const createTransport = () => {
-  const transports = BSC_RPC_ENDPOINTS.map(url => 
+  const transports = BSC_RPC_ENDPOINTS.map((url) =>
     http(url, {
-      timeout: 1200, // tighter timeout for lower latency
-      retryCount: 0, // do not retry per endpoint, let fallback handle it
-      retryDelay: 100 // short delay if any
+      timeout: 1500,
+      retryCount: 0,
+      retryDelay: 100,
+      fetch: instrumentedFetchFor(url),
     })
   );
-  
+
   return fallback(transports, {
-    rank: false, // Don't rank by response time - use order in array
-    retryCount: 1, // minimal retries across transports
-    retryDelay: 150 // quicker fallback between endpoints
+    rank: false,
+    retryCount: 1,
+    retryDelay: 150,
   });
 };
 
@@ -229,7 +383,7 @@ export const getCurrentRPCEndpoint = async (): Promise<string> => {
   try {
     // Make a simple call to see which endpoint responds
     await publicClient.getBlockNumber();
-    return 'Endpoint working (check logs for actual URL)';
+    return 'Endpoint working (check metrics for usage details)';
   } catch (error) {
     return `Error: ${(error as Error).message}`;
   }
@@ -265,3 +419,59 @@ export const testRPCConnectivity = async (): Promise<{ success: boolean; working
     errors
   };
 };
+
+/**
+ * Get a snapshot of RPC usage for observability.
+ * windowMs: time window to aggregate over (default: 60s)
+ */
+export function getRpcMetricsSnapshot(windowMs: number = 60_000): {
+  callsByMethod: Record<string, number>;
+  estCusByMethod: Record<string, number>;
+  estCusTotal: number;
+  estCusPerSecAvg: number;
+  estCusPerSecCurrent: number;
+  byEndpoint: Record<string, { calls: number; estCus: number }>;
+  headerCusTotal: number;
+  headerLastSeen: Record<string, string>;
+} {
+  const now = Date.now();
+  const since = now - windowMs;
+  const inWindow = metrics.estCusTimeline.filter((e) => e.ts >= since);
+  const estCusTotal = inWindow.reduce((s, e) => s + e.cus, 0);
+
+  // Current second usage
+  const currentSecond = now - 1000;
+  const currentCus = metrics.estCusTimeline
+    .filter((e) => e.ts >= currentSecond)
+    .reduce((s, e) => s + e.cus, 0);
+
+  const callsByMethod: Record<string, number> = {};
+  for (const [k, v] of metrics.callsByMethod.entries()) callsByMethod[k] = v;
+  const estCusByMethod: Record<string, number> = {};
+  for (const [k, v] of metrics.estCusByMethod.entries()) estCusByMethod[k] = v;
+  const byEndpoint: Record<string, { calls: number; estCus: number }> = {};
+  for (const [k, v] of metrics.byEndpoint.entries()) byEndpoint[k] = v;
+
+  return {
+    callsByMethod,
+    estCusByMethod,
+    estCusTotal,
+    estCusPerSecAvg: estCusTotal / (windowMs / 1000),
+    estCusPerSecCurrent: currentCus,
+    byEndpoint,
+    headerCusTotal: metrics.headerCusTotal,
+    headerLastSeen: { ...metrics.headerLastSeen },
+  };
+}
+
+/**
+ * Reset metrics (useful in tests)
+ */
+export function resetRpcMetrics(): void {
+  metrics.callsByMethod.clear();
+  metrics.estCusByMethod.clear();
+  metrics.estCusTimeline.length = 0;
+  metrics.byEndpoint.clear();
+  metrics.headerCusTotal = 0;
+  metrics.headerLastSeen = {};
+}

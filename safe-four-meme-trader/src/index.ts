@@ -1,5 +1,6 @@
 import dotenv from 'dotenv';
 import { BotService } from './services/bot';
+import { getRpcMetricsSnapshot } from './services/rpc';
 import { config } from './config';
 
 // Load environment variables
@@ -48,6 +49,21 @@ async function main() {
     });
 
     console.log('✅ Bot is running! Press Ctrl+C to stop.');
+
+    // Optional: periodic CU usage logging (toggle with env)
+    if (process.env.RPC_LOG_METRICS === 'true') {
+      setInterval(() => {
+        const snap = getRpcMetricsSnapshot(60_000);
+        console.log('[RPC] CU last 60s:', {
+          estCusTotal: snap.estCusTotal,
+          estCusPerSecAvg: Number(snap.estCusPerSecAvg.toFixed(2)),
+          estCusPerSecCurrent: snap.estCusPerSecCurrent,
+          topMethods: Object.entries(snap.estCusByMethod)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 5),
+        });
+      }, 60_000);
+    }
 
   } catch (error) {
     console.error('💥 Failed to start application:', error);
